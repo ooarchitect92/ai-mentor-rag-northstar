@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AI Mentor for CMA / CPA / ACCA / EA</title>
+  <style>
+    :root { font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; background: #f6f7fb; color: #111827; }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 28px 18px; }
+    .hero { background: #111827; color: white; border-radius: 24px; padding: 28px; box-shadow: 0 16px 45px rgba(17,24,39,.18); }
+    .hero h1 { margin: 0 0 8px; font-size: 32px; }
+    .hero p { margin: 0; color: #d1d5db; }
+    .panel { margin-top: 18px; background: white; border-radius: 24px; padding: 18px; box-shadow: 0 10px 30px rgba(17,24,39,.08); }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+    select, input, textarea, button {
+      border: 1px solid #d1d5db; border-radius: 14px; padding: 12px 14px; font-size: 15px;
+    }
+    select, input { flex: 1; min-width: 160px; }
+    textarea { width: 100%; min-height: 92px; box-sizing: border-box; resize: vertical; }
+    button { background: #111827; color: white; cursor: pointer; border: 0; min-width: 140px; }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    .answer { white-space: pre-wrap; line-height: 1.6; padding: 16px; border-radius: 18px; background: #f9fafb; min-height: 180px; border: 1px solid #e5e7eb; }
+    .hint { color: #6b7280; font-size: 13px; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <h1>AI Mentor</h1>
+      <p>For CMA / CPA / ACCA / EA learning, revision, doubts, quizzes, and job-hunt help.</p>
+    </section>
+
+    <section class="panel">
+      <div class="row">
+        <select id="course">
+          <option>CMA</option>
+          <option>CPA</option>
+          <option>ACCA</option>
+          <option>EA</option>
+          <option>GENERAL</option>
+        </select>
+        <select id="mode">
+          <option value="teach">Teach</option>
+          <option value="doubt_solving">Doubt Solving</option>
+          <option value="quiz">Quiz</option>
+          <option value="revise">Revision</option>
+          <option value="job_hunt">Job Hunt</option>
+        </select>
+        <select id="level">
+          <option value="beginner">Beginner</option>
+          <option value="intermediate">Intermediate</option>
+          <option value="advanced">Advanced</option>
+        </select>
+      </div>
+
+      <textarea id="message" placeholder="Ask: Explain variance analysis with examples, or prepare me for Big 4 FP&A interview..."></textarea>
+
+      <div class="row">
+        <button id="send">Ask Mentor</button>
+      </div>
+
+      <div id="answer" class="answer">Your mentor answer will appear here...</div>
+      <div class="hint">Tip: ingest your own PDFs and notes first for institute-specific answers.</div>
+    </section>
+  </div>
+
+<script>
+const sendBtn = document.getElementById("send");
+const answer = document.getElementById("answer");
+
+sendBtn.addEventListener("click", async () => {
+  const payload = {
+    student_id: "demo_student",
+    course: document.getElementById("course").value,
+    mode: document.getElementById("mode").value,
+    level: document.getElementById("level").value,
+    message: document.getElementById("message").value,
+    use_cache: true
+  };
+
+  if (!payload.message.trim()) return;
+
+  answer.textContent = "";
+  sendBtn.disabled = true;
+
+  try {
+    const response = await fetch("/v1/chat/stream", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload)
+    });
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const events = buffer.split("\n\n");
+      buffer = events.pop();
+
+      for (const event of events) {
+        if (event.includes("event: done")) continue;
+        const lines = event.split("\n").filter(line => line.startsWith("data: "));
+        const text = lines.map(line => line.slice(6)).join("\n");
+        if (text && text !== "[DONE]") answer.textContent += text;
+      }
+    }
+  } catch (err) {
+    answer.textContent = "Error: " + err.message;
+  } finally {
+    sendBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>
