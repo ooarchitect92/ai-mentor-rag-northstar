@@ -1,15 +1,15 @@
-# NorthStar-style CMA Landing Page Sample
+# NorthStar Academy CMA Course Information
 
-This sample document represents public-facing institute information. Replace it with your official and approved content.
+This document represents approved NorthStar Academy course information.
 
 NorthStar Academy positions the CMA USA journey as a global finance career path. The course audience includes students and working professionals who want structured online classes, mentor-led learning, and career guidance.
 
-Public page highlights include:
+Course highlights include:
 - CMA USA online classes
 - career path in approximately 6 to 9 months
 - mentor-led training
 - student success stories
-- Big 4 and MNC placement focus
+- finance career preparation and placement guidance
 - counseling and personalized study plan
 - Bengaluru headquarters
 - finance certification and career guidance

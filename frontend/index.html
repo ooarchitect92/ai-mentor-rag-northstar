@@ -3,12 +3,13 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>AI Mentor for CMA / CPA / ACCA / EA</title>
+  <title>AI Mentor for CMA / CPA / CFA / ACCA / CS / EA</title>
   <style>
     :root { font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
     body { margin: 0; background: #f6f7fb; color: #111827; }
     .wrap { max-width: 980px; margin: 0 auto; padding: 28px 18px; }
     .hero { background: #111827; color: white; border-radius: 24px; padding: 28px; box-shadow: 0 16px 45px rgba(17,24,39,.18); }
+    .hero-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; }
     .hero h1 { margin: 0 0 8px; font-size: 32px; }
     .hero p { margin: 0; color: #d1d5db; }
     .panel { margin-top: 18px; background: white; border-radius: 24px; padding: 18px; box-shadow: 0 10px 30px rgba(17,24,39,.08); }
@@ -22,52 +23,167 @@
     button:disabled { opacity: .55; cursor: not-allowed; }
     .answer { white-space: pre-wrap; line-height: 1.6; padding: 16px; border-radius: 18px; background: #f9fafb; min-height: 180px; border: 1px solid #e5e7eb; }
     .hint { color: #6b7280; font-size: 13px; margin-top: 10px; }
+    .admin-link { color: #e5e7eb; text-decoration: none; border: 1px solid #4b5563; border-radius: 12px; padding: 9px 12px; white-space: nowrap; }
+    .admin-link:hover, .admin-link:focus-visible { background: #1f2937; outline: 2px solid #93c5fd; outline-offset: 2px; }
+    .feedback-panel { display: flex; align-items: center; justify-content: space-between; gap: 24px; }
+    .feedback-copy h2 { margin: 0 0 6px; font-size: 20px; }
+    .feedback-copy p { margin: 0; color: #4b5563; line-height: 1.5; }
+    .whatsapp-link { display: inline-flex; align-items: center; justify-content: center; background: #128c7e; color: white; text-decoration: none; border-radius: 14px; padding: 12px 16px; font-weight: 650; white-space: nowrap; }
+    .whatsapp-link:hover, .whatsapp-link:focus-visible { background: #0f766e; outline: 3px solid rgba(18,140,126,.25); outline-offset: 2px; }
+    .whatsapp-link[aria-disabled="true"] { opacity: .5; pointer-events: none; }
+    .sr-status { min-height: 20px; color: #6b7280; font-size: 13px; margin-top: 8px; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+    @media (max-width: 640px) {
+      .wrap { padding: 16px 12px; }
+      .hero, .panel { border-radius: 18px; }
+      .hero-head, .feedback-panel { flex-direction: column; }
+      .whatsapp-link { width: 100%; box-sizing: border-box; }
+    }
+
+    /* Shared NorthStar visual system */
+    :root {
+      --ink: #102a27; --muted: #607b76; --line: #dbe5e2; --paper: #fffefa;
+      --canvas: #f4f3ed; --teal: #17675c;
+      --font-body: Inter, "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+      --font-display: "Segoe UI Variable Display", "Aptos Display", Inter, system-ui, sans-serif;
+      font-family: var(--font-body); color: var(--ink); background: var(--canvas);
+      font-synthesis: none; text-rendering: optimizeLegibility;
+    }
+    * { box-sizing: border-box; }
+    body { min-width: 320px; min-height: 100vh; background: var(--canvas); color: var(--ink); line-height: 1.5; }
+    button, select, textarea { font: inherit; }
+    :focus-visible { outline: 3px solid rgba(42,142,127,.35); outline-offset: 2px; }
+    .wrap { width: min(100%, 1120px); max-width: none; padding: clamp(18px, 4vw, 48px); }
+    .hero { position: relative; overflow: hidden; padding: clamp(28px, 5vw, 52px); background: linear-gradient(135deg, #102a27, #174a43); border-radius: 28px; box-shadow: 0 24px 60px rgba(16,42,39,.18); }
+    .hero::after { position: absolute; right: -90px; bottom: -150px; width: 260px; height: 260px; content: ""; background: rgba(116,198,183,.14); border-radius: 50%; }
+    .hero-head { position: relative; z-index: 1; gap: 28px; }
+    .eyebrow { display: block; margin-bottom: 10px; color: #9fd8cd; font-size: .72rem; font-weight: 800; letter-spacing: .14em; text-transform: uppercase; }
+    .hero h1 { max-width: 720px; margin-bottom: 12px; font-family: var(--font-display); font-size: clamp(2.1rem, 6vw, 4rem); font-weight: 720; line-height: 1; letter-spacing: -.045em; }
+    .hero p { max-width: 690px; color: #c8d9d6; font-size: clamp(.98rem, 2vw, 1.12rem); line-height: 1.65; }
+    .panel { margin-top: 22px; padding: clamp(20px, 3vw, 30px); background: var(--paper); border: 1px solid rgba(181,199,195,.72); border-radius: 22px; box-shadow: 0 10px 30px rgba(16,42,39,.065); }
+    .panel-heading { display: flex; margin-bottom: 22px; align-items: flex-end; justify-content: space-between; gap: 18px; }
+    .panel-heading h2 { margin: 0; font-family: var(--font-display); font-size: clamp(1.35rem, 3vw, 1.75rem); line-height: 1.15; letter-spacing: -.025em; }
+    .panel-heading p { margin: 5px 0 0; color: var(--muted); font-size: .9rem; }
+    .field-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin-bottom: 18px; }
+    .field { display: grid; min-width: 0; gap: 7px; }
+    .field label, .answer-heading { color: #294d48; font-size: .78rem; font-weight: 750; }
+    select, textarea { width: 100%; color: var(--ink); background: white; border: 1px solid #cbd9d6; border-radius: 12px; transition: border-color 150ms ease, box-shadow 150ms ease; }
+    select { min-width: 0; min-height: 48px; padding: 0 42px 0 14px; }
+    textarea { min-height: 138px; padding: 14px 16px; line-height: 1.6; resize: vertical; }
+    select:hover, textarea:hover { border-color: #9eb8b3; }
+    select:focus, textarea:focus { border-color: #2a8e7f; outline: 0; box-shadow: 0 0 0 3px rgba(42,142,127,.11); }
+    .actions { display: flex; margin: 14px 0 24px; align-items: center; justify-content: space-between; gap: 16px; }
+    .hint { margin: 0; color: var(--muted); font-size: .8rem; }
+    button { min-width: 150px; min-height: 48px; padding: 11px 20px; background: var(--ink); border-radius: 12px; font-weight: 750; box-shadow: 0 8px 18px rgba(16,42,39,.15); transition: background 150ms ease, transform 150ms ease; }
+    button:hover:not(:disabled) { background: var(--teal); transform: translateY(-1px); }
+    .answer-heading { display: flex; margin-bottom: 8px; align-items: center; justify-content: space-between; }
+    .answer { min-height: 200px; padding: clamp(16px, 3vw, 24px); color: #183c37; background: #f8faf9; border-color: var(--line); border-radius: 16px; font-size: .95rem; line-height: 1.72; overflow-wrap: anywhere; }
+    .admin-link { position: relative; z-index: 1; display: inline-flex; min-height: 42px; padding: 9px 14px; align-items: center; color: #edf8f5; border-color: rgba(255,255,255,.24); border-radius: 11px; font-size: .82rem; font-weight: 700; }
+    .admin-link:hover { background: rgba(255,255,255,.09); }
+    .feedback-panel { gap: 28px; }
+    .feedback-copy h2 { font-family: var(--font-display); font-size: clamp(1.2rem, 2.5vw, 1.5rem); letter-spacing: -.02em; }
+    .feedback-copy p { max-width: 720px; color: var(--muted); font-size: .9rem; line-height: 1.6; }
+    .whatsapp-link { min-height: 48px; padding: 11px 18px; background: #147d70; border-radius: 12px; font-size: .84rem; font-weight: 750; }
+    .whatsapp-link:hover { background: #0f665d; }
+    .sr-status { color: var(--muted); font-size: .78rem; }
+    @media (max-width: 760px) {
+      .wrap { padding: 14px; }
+      .hero, .panel { border-radius: 18px; }
+      .hero-head, .feedback-panel, .actions { align-items: stretch; flex-direction: column; }
+      .field-grid { grid-template-columns: 1fr; }
+      .admin-link { align-self: flex-start; }
+      button, .whatsapp-link { width: 100%; }
+    }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition-duration: .01ms !important; } }
   </style>
 </head>
 <body>
   <div class="wrap">
     <section class="hero">
-      <h1>AI Mentor</h1>
-      <p>For CMA / CPA / ACCA / EA learning, revision, doubts, quizzes, and job-hunt help.</p>
+      <div class="hero-head">
+        <div>
+          <span class="eyebrow">NorthStar Academy</span>
+          <h1>AI Mentor</h1>
+          <p>NorthStar Academy course learning, revision, doubts, quizzes, and career preparation.</p>
+        </div>
+        <a class="admin-link" href="/admin/">Admin dashboard</a>
+      </div>
     </section>
 
-    <section class="panel">
-      <div class="row">
+    <main>
+    <section class="panel" aria-labelledby="mentor-heading">
+      <div class="panel-heading"><div><h2 id="mentor-heading">Ask your mentor</h2><p>Choose your learning context and send one clear course question.</p></div></div>
+      <div class="field-grid">
+        <div class="field"><label for="course">Course</label>
         <select id="course">
           <option>CMA</option>
           <option>CPA</option>
+          <option>CFA</option>
           <option>ACCA</option>
+          <option>CS</option>
           <option>EA</option>
-          <option>GENERAL</option>
-        </select>
+        </select></div>
+        <div class="field"><label for="mode">Learning mode</label>
         <select id="mode">
           <option value="teach">Teach</option>
           <option value="doubt_solving">Doubt Solving</option>
           <option value="quiz">Quiz</option>
           <option value="revise">Revision</option>
           <option value="job_hunt">Job Hunt</option>
-        </select>
+        </select></div>
+        <div class="field"><label for="level">Explanation level</label>
         <select id="level">
           <option value="beginner">Beginner</option>
           <option value="intermediate">Intermediate</option>
           <option value="advanced">Advanced</option>
-        </select>
+        </select></div>
       </div>
 
-      <textarea id="message" placeholder="Ask: Explain variance analysis with examples, or prepare me for Big 4 FP&A interview..."></textarea>
+      <div class="field"><label for="message">Your question</label>
+      <textarea id="message" placeholder="Ask a question about your NorthStar Academy course material..."></textarea></div>
 
-      <div class="row">
-        <button id="send">Ask Mentor</button>
+      <div class="actions">
+        <p class="hint">Use a specific question for a clearer, more useful explanation.</p>
+        <button id="send" type="button">Ask Mentor</button>
       </div>
 
-      <div id="answer" class="answer">Your mentor answer will appear here...</div>
-      <div class="hint">Tip: ingest your own PDFs and notes first for institute-specific answers.</div>
+      <div class="answer-heading"><span>Mentor answer</span><span aria-hidden="true">AI-assisted</span></div>
+      <div id="answer" class="answer" role="status" aria-live="polite">Your mentor answer will appear here...</div>
+    </section>
+    </main>
+
+    <section class="panel feedback-panel" aria-labelledby="feedback-title">
+      <div class="feedback-copy">
+        <h2 id="feedback-title">Found an error or want a change?</h2>
+        <p>Send feedback privately through WhatsApp. You can attach a JPG or PNG screenshot in WhatsApp before sending.</p>
+        <div id="feedbackStatus" class="sr-status" role="status" aria-live="polite">Loading the feedback option…</div>
+      </div>
+      <a id="feedbackLink" class="whatsapp-link" href="#" target="_blank" rel="noopener noreferrer" aria-disabled="true">Give feedback on WhatsApp</a>
     </section>
   </div>
 
 <script>
 const sendBtn = document.getElementById("send");
 const answer = document.getElementById("answer");
+const feedbackLink = document.getElementById("feedbackLink");
+const feedbackStatus = document.getElementById("feedbackStatus");
+
+async function loadPublicConfig() {
+  try {
+    const response = await fetch("/v1/public/config", {headers: {"Accept": "application/json"}});
+    if (!response.ok) throw new Error("Feedback configuration could not be loaded");
+    const config = await response.json();
+    if (config.feedback?.enabled && config.feedback.whatsapp_url) {
+      feedbackLink.href = config.feedback.whatsapp_url;
+      feedbackLink.setAttribute("aria-disabled", "false");
+      feedbackStatus.textContent = config.feedback.attachment_note;
+    } else {
+      feedbackStatus.textContent = "WhatsApp feedback will be available after the academy configures its feedback number.";
+    }
+  } catch (error) {
+    feedbackStatus.textContent = "The WhatsApp feedback option is temporarily unavailable.";
+  }
+}
 
 sendBtn.addEventListener("click", async () => {
   const payload = {
@@ -90,6 +206,11 @@ sendBtn.addEventListener("click", async () => {
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify(payload)
     });
+
+    if (!response.ok || !response.body) {
+      const payload = await response.json().catch(() => ({}));
+      throw new Error(payload.detail || `Request failed (${response.status})`);
+    }
 
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
@@ -116,6 +237,8 @@ sendBtn.addEventListener("click", async () => {
     sendBtn.disabled = false;
   }
 });
+
+loadPublicConfig();
 </script>
 </body>
 </html>

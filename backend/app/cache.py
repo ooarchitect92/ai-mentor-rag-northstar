@@ -10,7 +10,7 @@ def normalize_question(course: str, message: str, mode: str, level: str) -> str:
 
 
 def cache_key(course: str, message: str, mode: str, level: str) -> str:
-    return "mentor:answer:" + hashlib.sha256(
+    return "mentor:answer:course-flexible-v3:" + hashlib.sha256(
         normalize_question(course, message, mode, level).encode("utf-8")
     ).hexdigest()
 
@@ -62,3 +62,6 @@ class Cache:
             await self.redis.delete(key)
         except Exception:
             return
+
+    async def aclose(self) -> None:
+        await self.redis.aclose()

@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#112f2b">
+  <meta name="description" content="NorthStar Academy AI Mentor administration dashboard">
+  <title>NorthStar Control Center</title>
+  <link rel="stylesheet" href="./assets/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to dashboard content</a>
+
+  <div id="route-progress" class="route-progress" aria-hidden="true"></div>
+
+  <main id="login-view" class="login-view">
+    <section class="login-card" aria-labelledby="login-title">
+      <div class="brand brand--login" aria-label="NorthStar Academy">
+        <span class="brand__mark" aria-hidden="true">
+          <svg viewBox="0 0 40 40" role="img"><path d="M20 4.5 24 15l11 .6-8.5 7 2.8 10.8L20 27.5l-9.3 5.9 2.8-10.8-8.5-7L16 15l4-10.5Z"/></svg>
+        </span>
+        <span>
+          <strong>NorthStar</strong>
+          <small>AI Mentor operations</small>
+        </span>
+      </div>
+
+      <div class="login-card__intro">
+        <span class="eyebrow">Secure administration</span>
+        <h1 id="login-title">Welcome back</h1>
+        <p>Manage knowledge, review feedback, and keep your mentor experience current.</p>
+      </div>
+
+      <form id="login-form" novalidate>
+        <div class="field">
+          <label for="admin-token">Admin token</label>
+          <div class="password-field">
+            <input
+              id="admin-token"
+              name="token"
+              type="password"
+              autocomplete="current-password"
+              spellcheck="false"
+              required
+              aria-describedby="token-help login-error"
+              placeholder="Enter your admin token"
+            >
+            <button id="toggle-token" class="icon-button password-field__toggle" type="button" aria-label="Show admin token" aria-pressed="false">
+              <svg class="icon icon--eye" viewBox="0 0 24 24" aria-hidden="true"><path d="M2.6 12s3.4-6 9.4-6 9.4 6 9.4 6-3.4 6-9.4 6-9.4-6-9.4-6Z"/><circle cx="12" cy="12" r="2.7"/></svg>
+            </button>
+          </div>
+          <p id="token-help" class="field-help">Stored only in this browser tab and cleared when you sign out.</p>
+          <p id="login-error" class="form-error" role="alert" hidden></p>
+        </div>
+        <button id="login-submit" class="button button--primary button--wide" type="submit">
+          <span>Open control center</span>
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>
+        </button>
+      </form>
+
+      <div class="security-note">
+        <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 10V7.5a5.5 5.5 0 0 1 11 0V10M5 10h14v10H5z"/></svg>
+        <span>Secrets and provider credentials are never displayed here.</span>
+      </div>
+    </section>
+    <aside class="login-art" aria-hidden="true">
+      <div class="login-art__orb login-art__orb--one"></div>
+      <div class="login-art__orb login-art__orb--two"></div>
+      <div class="login-art__content">
+        <span class="login-art__kicker">One operational view</span>
+        <p>Turn learning material and student feedback into a better mentor experience.</p>
+        <div class="login-art__metrics">
+          <span><b>RAG</b> knowledge indexing</span>
+          <span><b>Live</b> feedback workflow</span>
+          <span><b>Safe</b> configuration</span>
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <div id="dashboard-app" class="app-shell" hidden>
+    <div id="sidebar-backdrop" class="sidebar-backdrop" hidden></div>
+    <aside id="sidebar" class="sidebar" aria-label="Primary navigation">
+      <div class="brand brand--sidebar">
+        <span class="brand__mark" aria-hidden="true">
+          <svg viewBox="0 0 40 40"><path d="M20 4.5 24 15l11 .6-8.5 7 2.8 10.8L20 27.5l-9.3 5.9 2.8-10.8-8.5-7L16 15l4-10.5Z"/></svg>
+        </span>
+        <span class="brand__copy">
+          <strong>NorthStar</strong>
+          <small>Control center</small>
+        </span>
+      </div>
+
+      <nav class="sidebar__nav">
+        <p class="sidebar__label">Workspace</p>
+        <button class="nav-item is-active" type="button" data-route="overview" aria-current="page">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+          <span>Overview</span>
+        </button>
+        <button class="nav-item" type="button" data-route="knowledge">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v17H6.5A2.5 2.5 0 0 0 4 21.5v-17Z"/><path d="M4 21.5A2.5 2.5 0 0 1 6.5 19H20"/></svg>
+          <span>Knowledge</span>
+        </button>
+        <button class="nav-item" type="button" data-route="training">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 1.7 5.3L19 10l-5.3 1.7L12 17l-1.7-5.3L5 10l5.3-1.7L12 3Z"/><path d="m19 16 .8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8L19 16Z"/></svg>
+          <span>Training</span>
+        </button>
+        <button class="nav-item" type="button" data-route="feedback">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15a3 3 0 0 1-3 3H9l-6 4V6a3 3 0 0 1 3-3h12a3 3 0 0 1 3 3v9Z"/><path d="M8 8h8M8 12h5"/></svg>
+          <span>Feedback</span>
+          <span id="feedback-nav-count" class="nav-item__count" hidden></span>
+        </button>
+        <button class="nav-item" type="button" data-route="enrollments">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="9" cy="8" r="4"/><path d="M2.5 21v-2a5.5 5.5 0 0 1 5.5-5.5h2a5.5 5.5 0 0 1 5.5 5.5v2M18 8v6M15 11h6"/></svg>
+          <span>Enrollments</span>
+        </button>
+        <button class="nav-item" type="button" data-route="analytics">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>
+          <span>Analytics</span>
+        </button>
+        <button class="nav-item" type="button" data-route="activity">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8v5l3 2"/><circle cx="12" cy="12" r="9"/><path d="M4.8 4.8 3 7m0-4v4h4"/></svg>
+          <span>Activity</span>
+        </button>
+
+        <p class="sidebar__label sidebar__label--second">System</p>
+        <button class="nav-item" type="button" data-route="configuration">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg>
+          <span>Configuration</span>
+        </button>
+      </nav>
+
+      <div class="sidebar__footer">
+        <div class="connection-state">
+          <span class="connection-state__dot" aria-hidden="true"></span>
+          <span><strong>Admin API</strong><small id="connection-label">Connected</small></span>
+        </div>
+        <button id="logout-button" class="nav-item nav-item--logout" type="button">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 4H5v16h5M14 8l4 4-4 4M8 12h10"/></svg>
+          <span>Sign out</span>
+        </button>
+      </div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <button id="menu-button" class="icon-button topbar__menu" type="button" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+        </button>
+        <div class="topbar__heading">
+          <span id="page-eyebrow" class="eyebrow">Workspace</span>
+          <h1 id="page-title">Overview</h1>
+        </div>
+        <div class="topbar__actions">
+          <span id="last-updated" class="last-updated" aria-live="polite"></span>
+          <button id="refresh-button" class="button button--secondary button--icon-mobile" type="button">
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 6v5h-5M4 18v-5h5"/><path d="M18.5 9A7 7 0 0 0 6 6.5L4 9m2 6a7 7 0 0 0 12 2.5L20 15"/></svg>
+            <span>Refresh</span>
+          </button>
+        </div>
+      </header>
+
+      <main id="main-content" class="content" tabindex="-1">
+        <div id="view-root" aria-live="polite"></div>
+      </main>
+    </div>
+  </div>
+
+  <dialog id="app-dialog" class="dialog" aria-labelledby="dialog-title">
+    <div class="dialog__surface">
+      <div class="dialog__header">
+        <div>
+          <span id="dialog-eyebrow" class="eyebrow"></span>
+          <h2 id="dialog-title"></h2>
+        </div>
+        <button id="dialog-close" class="icon-button" type="button" aria-label="Close dialog">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+        </button>
+      </div>
+      <div id="dialog-body" class="dialog__body"></div>
+    </div>
+  </dialog>
+
+  <div id="toast-region" class="toast-region" role="status" aria-live="polite" aria-atomic="true"></div>
+
+  <script type="module" src="./assets/app.js"></script>
+</body>
+</html>

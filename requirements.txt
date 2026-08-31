@@ -8,7 +8,9 @@ python-multipart==0.0.20
 redis==6.2.0
 pypdf==5.6.0
 python-docx==1.1.2
+openpyxl==3.1.5
 httpx==0.28.1
+google-auth[requests]==2.40.3
 tenacity==9.1.2
 orjson==3.10.18
 pytest==8.4.0

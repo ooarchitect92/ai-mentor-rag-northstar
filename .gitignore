@@ -41,6 +41,7 @@ MANIFEST
 
 # Testing
 .pytest_cache/
+.artifacts/
 .coverage
 htmlcov/
 .tox/
@@ -49,6 +50,13 @@ htmlcov/
 *.db
 *.sqlite
 *.sqlite3
+data/admin.sqlite3.*
+*.db-shm
+*.db-wal
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3-shm
+*.sqlite3-wal
 
 # Cache files
 .cache/
@@ -63,16 +71,24 @@ node_modules/
 npm-debug.log
 
 # Docker
-.dockerignore
 
 # Logs
 *.log
 logs/
+data/question_answers.txt
+data/whatsapp_enrollments.xlsx
+data/feedback-media/
+data/backups/
+data/runtime-config.json
+data/mentor-system-prompt.txt
+data/.*.tmp
 
 # API Keys and sensitive data
 .env
 .env.local
 .env.*.local
+secrets/*
+!secrets/.gitkeep
 
 # pytest
 .pytest_cache

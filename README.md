@@ -1,16 +1,29 @@
-# AI Mentor RAG for CMA / CPA / ACCA / EA Training Institutes
+# AI Mentor for CMA / CPA / CFA / ACCA / CS / EA
 
 A production-oriented starter project for an AI mentor that teaches students using your own institute content, notes, PDFs, recordings transcripts, FAQs, placement guidance, and course material.
+
+## Documentation map
+
+- [Project structure](docs/PROJECT_STRUCTURE.md) — ownership and persistence boundaries
+- [Admin operations](docs/ADMIN_OPERATIONS.md) — every dashboard page and workflow
+- [Testing and release checks](docs/TESTING.md) — coverage and deployment gate
+- [Backend](backend/README.md), [dashboard](admin-dashboard/README.md), [scripts](scripts/README.md), and [tests](tests/README.md) folder notes
+
+This README and `docs/` are authoritative. Superseded one-off WhatsApp guides
+and manual utilities are isolated under `docs/archive/legacy-whatsapp/` and
+`scripts/archive/legacy-whatsapp/`; they are reference material, not supported
+production instructions.
 
 This project is designed for fast responses:
 - FastAPI async backend
 - Server-Sent Events streaming
 - Qdrant vector database
-- Redis response cache
-- Claude mentor answers through Anthropic Messages API
+- Persistent `.txt` question-and-answer library plus Redis repetition state
+- NVIDIA Nemotron mentor answers with automatic Gemini fallback
 - Local hash embeddings by default, with optional OpenAI semantic embeddings
 - Short prompt context with top-k retrieval
-- Admin upload endpoint for adding course content
+- Separate admin control center for editable content, RAG indexing, feedback, enrollments, and safe runtime settings
+- WhatsApp-only change/error feedback with optional JPG/PNG screenshots
 
 > Replace the sample NorthStar-style content with your actual licensed study notes, recorded class transcripts, question banks, policy docs, placement guides, and FAQs.
 
@@ -18,8 +31,8 @@ This project is designed for fast responses:
 
 ## What this AI mentor can do
 
-1. Teach concepts in CMA / CPA / ACCA / EA
-2. Answer from your uploaded content using RAG
+1. Teach concepts in CMA / CPA / CFA / ACCA / CS / EA
+2. Classify each question against the student's active course
 3. Ask Socratic follow-up questions
 4. Generate practice questions and quizzes
 5. Explain weak areas
@@ -37,13 +50,17 @@ Student Web Chat / WhatsApp
       v
 FastAPI API
       |
-      +-- Redis cache for repeated questions
+      +-- Redis per-student repetition and clarification state
+
+      +-- data/question_answers.txt reusable answer library
       |
       +-- Hash/OpenAI embedding for student query
       |
       +-- Qdrant vector search over institute content
       |
-      +-- Anthropic Claude Messages API
+      +-- SQLite admin catalog, training jobs, feedback, and audit events
+      |
+      +-- NVIDIA NIM Nemotron (primary) / Gemini (fallback)
       |
       v
 SSE tokens to browser or WhatsApp reply via Meta Graph API
@@ -61,18 +78,30 @@ ai-mentor-rag-northstar/
       config.py
       schemas.py
       auth.py
+      admin_api.py
+      admin_store.py
       cache.py
       chunking.py
       documents.py
       embeddings.py
       vector_store.py
+      nvidia.py
+      question_history.py
+      training.py
+      webhook_queue.py
       whatsapp.py
       mentor.py
       prompts.py
   frontend/
     index.html
+  admin-dashboard/
+    index.html
+    assets/
+      app.js
+      styles.css
   scripts/
     ingest_directory.py
+    migrate_legacy_knowledge.py
     seed_sample_docs.py
   data/
     sample_docs/
@@ -91,10 +120,16 @@ ai-mentor-rag-northstar/
 
 ```bash
 cp .env.example .env
-# Add your ANTHROPIC_API_KEY in .env
+# Add provider credentials and generate a long random ADMIN_TOKEN in .env
 
 docker compose up --build
 ```
+
+On Windows, `start.bat` does all of this in one step: it checks Docker, starts the
+stack, re-registers the WhatsApp webhook against the current tunnel URL, and then
+streams the container logs. Stop it by closing the window or pressing Ctrl+C —
+either way the containers are shut down. Use `stop.bat` if a stack is ever left
+running after a crash.
 
 Open the chat UI:
 
@@ -108,20 +143,56 @@ API docs:
 http://localhost:8000/docs
 ```
 
+Admin control center:
+
+```text
+http://localhost:8000/admin/
+```
+
+The admin token is retained only in the current browser tab. Provider keys,
+WhatsApp tokens, database URLs, and other deployment secrets are never returned
+to the dashboard and remain environment-managed.
+
 ---
 
-## 2. Seed sample knowledge base
+## 2. Manage and train the knowledge base
+
+Open `/admin/`, upload TXT/Markdown/PDF/DOCX source files, edit their extracted
+text and metadata, select the documents, and choose **Start RAG indexing**.
+“Training” in this application means chunking, embedding, and publishing content
+to the retrieval index; it does not fine-tune the NVIDIA, Gemini, or Anthropic
+foundation model. Published revisions remain available if a replacement upload
+fails, and edits use document versions to prevent accidental overwrites.
+
+Retrieval is constrained to the revision currently published in the SQLite
+catalog. If upgrading a deployment that already contains vectors created by the
+older ingestion scripts, inventory and adopt them before going live:
+
+```bash
+docker compose exec api python scripts/knowledge/migrate_legacy_knowledge.py
+docker compose exec api python scripts/knowledge/migrate_legacy_knowledge.py --apply
+```
+
+The first command is read-only. The second reconstructs editable source records
+and publishes new versioned vectors; legacy points remain invisible and may be
+removed later during a Qdrant maintenance window.
+
+`COURSE_RETRIEVAL_ENABLED=true` must remain enabled for indexed material to be
+used in mentor answers. The dashboard blocks indexing and shows a warning if it
+is disabled.
+
+### Seed or import from the command line
 
 After Docker is running:
 
 ```bash
-docker compose exec api python scripts/seed_sample_docs.py
+docker compose exec api python scripts/knowledge/seed_sample_docs.py
 ```
 
 Or ingest your own docs from a directory:
 
 ```bash
-docker compose exec api python scripts/ingest_directory.py /app/data/my_docs
+docker compose exec api python scripts/knowledge/ingest_directory.py /app/data/my_docs CMA
 ```
 
 Supported files:
@@ -132,11 +203,11 @@ Supported files:
 
 ---
 
-## 3. Add documents through API
+## 3. Add documents through the compatibility API
 
 ```bash
 curl -X POST "http://localhost:8000/v1/admin/ingest/files" \
-  -H "x-admin-token: change-me" \
+  -H "x-admin-token: $ADMIN_TOKEN" \
   -F "course=CMA" \
   -F "doc_type=lesson" \
   -F "files=@your-notes.pdf"
@@ -162,38 +233,179 @@ curl -N -X POST "http://localhost:8000/v1/chat/stream" \
 
 The bot uses the official Meta WhatsApp Cloud API webhook flow.
 
+For a legacy non-Ziplin integration where another application owns the Meta
+callback, keep that callback unchanged and forward payloads to
+`POST /v1/whatsapp/relay` using the private `X-Northstar-Relay-Token` header.
+Ziplin deployments should use the dedicated route and header in the next
+section. See `docs/ADMIN_OPERATIONS.md` for Python and Node examples. Direct Meta
+delivery at `/v1/whatsapp/webhook` remains supported.
+Set `WHATSAPP_WEBHOOK_CALLBACK_URL` to the existing permanent callback. In this
+mode `start.bat` validates and preserves that URL. Set
+`NORTHSTAR_PUBLIC_BASE_URL` to this application's permanent HTTPS origin and
+configure the existing webhook owner to forward to the resulting Ziplin relay
+URL. A temporary Cloudflare quick tunnel is useful for a manual test only; its
+hostname changes after a restart and is not production routing.
+
+### Isolated Ziplin number
+
+Use the dedicated paths for a Ziplin deployment so its routing is visibly
+separate from an existing NorthStar application:
+
+- Direct Meta callback: `GET/POST /v1/whatsapp/ziplin/webhook`
+- Authenticated relay: `POST /v1/whatsapp/ziplin/relay`
+- Relay header: `X-Ziplin-Relay-Token: <WHATSAPP_RELAY_TOKEN>`
+
+Relay deployments also require a stable origin:
+
+```dotenv
+NORTHSTAR_PUBLIC_BASE_URL=https://mentor.example.com
+```
+
+The complete Xolox forwarding destination is then
+`https://mentor.example.com/v1/whatsapp/ziplin/relay`.
+
+Every inbound message is checked against `WHATSAPP_PHONE_NUMBER_ID` before it
+enters the durable queue and again before processing. A payload addressed to a
+different number is acknowledged as `ignored` and can never produce an outbound
+reply. Outbound messages are always sent through the configured Phone Number ID.
+Register the dedicated callback only on the Ziplin Meta app; do not replace the
+callback on the existing NorthStar Meta app.
+
+The dashboard Enrollments page includes a WhatsApp operations panel. It shows
+non-sensitive webhook, phone, account, enrollment-source, and durable-queue
+status. Its master switch changes `whatsapp_messaging_enabled` immediately.
+When paused, webhook verification remains available, new payloads are
+acknowledged without being queued, public feedback links are disabled, and all
+outbound WhatsApp sends are blocked. Access tokens and application secrets are
+never returned to the browser.
+
 Conversation flow:
 
 ```text
-Institute: sends an approved WhatsApp template invite, for example a "Hi" template
-Student: replies to that template, or sends hi directly
-Bot: shows a WhatsApp program menu with:
-     1. CMA
-     2. CPA
-     3. ACCA
-     4. EA
-Student: chooses one program
-Bot: shows a WhatsApp learning-mode menu with:
+Any WhatsApp user: sends Hi, a CMA question, or a clear CMA-question image
+Bot: opens CMA and selects Teach automatically
+Bot: shows the WhatsApp learning-mode menu with:
      1. Teach
      2. Doubt Solving
      3. Quiz
      4. Revision
      5. Job Hunt
-Student: chooses one learning mode
-Bot: confirms the selected program + mode and asks for the question
-Student: asks the question
-Bot: replies with a phone-screen-friendly structured answer from Claude + RAG
+Student: can ask immediately, or choose another learning mode first
+Bot: verifies that the question belongs to CMA, then sends a descriptive answer
 ```
 
-The bot intentionally limits AI answers to the configured program plus one of these five modes. If a student has not chosen both a program and a mode, the bot asks them to choose from the correct menu first.
+With `WHATSAPP_OPEN_CMA_ACCESS=true`, CMA is available to every inbound number and is not written to the enrollment workbook. Sending `Hi` resets that conversation to `CMA | Teach`; a first-message text question or image is also handled as CMA Teach. Existing enrollment records can still grant additional courses. Set the flag to `false` to restore enrollment-only access.
+
+The mentor is not limited to uploaded knowledge. NorthStar Academy material can improve an answer, but any valid question within the active CMA, CPA, CFA, ACCA, CS, or EA course can be answered using the model's course knowledge. Questions outside the active course are refused. Student-facing replies never include citations or source lists.
+
+### WhatsApp-only feedback and screenshots
+
+The web application’s feedback button opens the configured WhatsApp business
+number with an explicit `FEEDBACK` marker. A student can either send a written
+change/error report or attach a JPG/PNG screenshot and put the description in
+its caption. Feedback is routed before the course-question flow, stored in the
+admin database, and appears in `/admin/` for review. The raw message and image
+remain immutable; admins edit only category, review status, and internal notes.
+
+Configure the public display number separately from Meta’s phone-number ID:
+
+```bash
+WHATSAPP_FEEDBACK_NUMBER=919999999999
+WHATSAPP_FEEDBACK_PREFILL="FEEDBACK\nPlease describe the change or error. You can also attach a screenshot."
+WHATSAPP_MAX_MEDIA_BYTES=5242880
+```
+
+The button is enabled only when the feedback number, Cloud API token,
+phone-number ID, and authenticated inbound route are configured. Direct routes
+need the Meta app secret; relay routes need both the relay token and a permanent
+`NORTHSTAR_PUBLIC_BASE_URL`. Browsers cannot pre-attach a local screenshot to a
+`wa.me` link; the student attaches it inside WhatsApp before sending.
+
+Feedback is accepted before tutoring enrollment checks so a visitor can report a
+broken experience, but per-number daily quotas and a global screenshot-storage
+cap are enforced. Raw reports are retained for `FEEDBACK_RETENTION_DAYS` (365 by
+default), after which the database record and screenshot are purged.
+
+Signed Meta webhook payloads are durably queued in SQLite before the API returns
+success. A leased, heartbeat-driven worker retries transient failures, preserves
+feedback-message order, and dead-letters events after the configured attempt cap.
+
+### Manage WhatsApp access from the live Excel workbook
+
+Open CMA access is independent of the workbook: while `WHATSAPP_OPEN_CMA_ACCESS=true`, removing or revoking a CMA row does not block CMA because CMA is intentionally public. The workbook controls additional courses and becomes the complete access authority again when open CMA access is disabled.
+
+By default, the dashboard writes enrollment changes to
+`data/whatsapp_enrollments.xlsx` on the host. Docker Compose mounts that same
+file location as `/app/data/whatsapp_enrollments.xlsx`, which is the value of
+`WHATSAPP_ENROLLMENTS_FILE` inside the API container. **Save enrollment** writes
+`YES`; revoking a course writes `NO`. The API completes only after the workbook
+has been saved atomically and reopened successfully, so the next dashboard or
+WhatsApp lookup sees the change immediately.
+
+Use the `Enrollments` tab with these required columns:
+
+| phone_number | course | active | student_name | notes |
+| --- | --- | --- | --- | --- |
+| 9535210826 | CMA | YES | Student name | Optional note |
+
+- `course` must be `CMA`, `CPA`, `CFA`, `ACCA`, `CS`, or `EA`.
+- For a new valid phone number, a blank `course` defaults to `CMA` and a blank
+  `active` value defaults to `YES`, so adding the number alone grants CMA access.
+- Repeat a phone number on separate rows to grant multiple courses.
+- `active=YES` grants access; `active=NO` revokes it.
+- Existing `student_name`, `notes`, formatting, and unrelated rows are preserved.
+- Direct edits made to the workbook are picked up automatically; press
+  **Refresh** in the dashboard to update the visible card.
+
+Excel Desktop does not automatically redraw an already-open workbook after
+another process replaces it on disk. Close and reopen the workbook, or use
+Excel's refresh/reload option, to see a dashboard change. If Excel locks the
+file, the dashboard shows a conflict instead of claiming that the enrollment
+was saved; close the workbook and retry.
+
+To use the private Google Sheet integration instead, configure a Sheet ID. When
+enabled, Google Sheets becomes the sole access authority and the dashboard can
+view, grant, revoke, and bulk-import enrollment state. A missing, inactive, or invalid row is
+denied and cannot fall back to Excel, Redis, or `.env`. The bot refreshes the
+private Sheet every 60 seconds and uses the last valid copy during a temporary
+Google outage.
+
+For a private Sheet, create a Google Cloud service account with Sheets API access, share the Sheet with its service-account email as **Editor**, and save its JSON key as `secrets/google-service-account.json`. Then configure:
+
+```bash
+WHATSAPP_ENROLLMENTS_GOOGLE_SHEET_ID=your-spreadsheet-id
+WHATSAPP_ENROLLMENTS_GOOGLE_SHEET_RANGE=Enrollments!A:E
+WHATSAPP_ENROLLMENTS_GOOGLE_REFRESH_SECONDS=60
+GOOGLE_SERVICE_ACCOUNT_FILE=/app/secrets/google-service-account.json
+```
+
+The `secrets` directory is mounted read-only and ignored by Git. Do not publish the Sheet to the web because it contains student phone numbers.
 
 Webhook callback URL:
 
 ```text
-https://your-public-domain.com/v1/whatsapp/webhook
+https://your-public-domain.com/v1/whatsapp/ziplin/webhook
 ```
 
-Localhost will not receive Meta webhooks directly. Use a public HTTPS deployment or a tunnel such as ngrok for local testing.
+Localhost will not receive Meta webhooks directly. The `public-tunnel` service is
+opt-in through the Compose `tunnel` profile (`docker compose --profile tunnel up`).
+It runs a cloudflared quick tunnel, but Cloudflare
+assigns it a **new random hostname on every start**, so the callback URL Meta has
+on file goes dead after each restart.
+
+`start.bat` handles that by running `scripts/windows/register_webhook.ps1` on every
+launch: it reads the tunnel URL out of the `public-tunnel` logs, waits until the
+API answers `/ready` through it, then re-registers it on the app subscription
+with `object=whatsapp_business_account` and the `messages` field. Existing
+subscribed fields are preserved. Run it by hand any time with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\windows\register_webhook.ps1
+```
+
+Because this repoints a live business number's webhook at your machine, incoming
+customer messages only reach the bot while the stack is running. For a URL that
+does not change, use a Cloudflare named tunnel or a public HTTPS deployment.
 
 Set these values in `.env`:
 
@@ -209,16 +421,29 @@ FACEBOOK_APP_ID=your-meta-app-id
 WHATSAPP_GRAPH_API_VERSION=v25.0
 WHATSAPP_GRAPH_BASE=https://graph.facebook.com/v25.0
 WHATSAPP_BUSINESS_ACCOUNT_ID=your-whatsapp-business-account-id
-WHATSAPP_DEFAULT_COURSE=GENERAL
-WHATSAPP_DEFAULT_MODE=doubt_solving
+WHATSAPP_OPEN_CMA_ACCESS=true
+WHATSAPP_DEFAULT_COURSE=CMA
+WHATSAPP_DEFAULT_MODE=teach
 WHATSAPP_DEFAULT_LEVEL=beginner
+WHATSAPP_MAX_MEDIA_BYTES=5242880
+WHATSAPP_FEEDBACK_NUMBER=919999999999
 WHATSAPP_START_TEMPLATE_NAME=hello_world
 WHATSAPP_START_TEMPLATE_LANGUAGE=en_US
 WHATSAPP_USE_MOCK=false
-WHATSAPP_TEST_TO=918971392035
+WHATSAPP_TEST_TO=
+WHATSAPP_ENROLLMENTS=919999999999:CMA
 ```
 
 `WHATSAPP_TOKEN` and `META_APP_SECRET` are accepted because the Cheerio project archive uses those names. `WHATSAPP_ACCESS_TOKEN` and `WHATSAPP_APP_SECRET` are the equivalent names in this Python app.
+
+Assign or change one student's enrolled course through the protected backend API:
+
+```bash
+curl -X PUT "http://localhost:8000/v1/admin/whatsapp/enrollments/919999999999" \
+  -H "x-admin-token: $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"course":"CMA"}'
+```
 
 In Meta Developer Console:
 - Add the callback URL above.
@@ -229,7 +454,7 @@ In Meta Developer Console:
 Run the WhatsApp diagnostics after changing Meta tokens or IDs:
 
 ```bash
-docker compose exec api python scripts/whatsapp_diagnostics.py
+docker compose exec api python scripts/whatsapp/whatsapp_diagnostics.py
 ```
 
 All checks should pass before the bot can send or reply through WhatsApp. If `debug_token` passes but `phone_object` fails, the token is valid but is not authorized for the configured `WHATSAPP_PHONE_NUMBER_ID`.
@@ -237,45 +462,36 @@ All checks should pass before the bot can send or reply through WhatsApp. If `de
 Send the first business-initiated "Hi" message from the app side:
 
 ```bash
-docker compose exec api python scripts/send_whatsapp_hi.py 9916039894
+docker compose exec api python scripts/whatsapp/send_whatsapp_hi.py "$WHATSAPP_TEST_TO"
 ```
 
 Or call the protected API:
 
 ```bash
 curl -X POST "http://localhost:8000/v1/admin/whatsapp/send-hi" \
-  -H "x-admin-token: change-me" \
+  -H "x-admin-token: $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"to":"9916039894"}'
+  -d '{"to":"919999999999"}'
 ```
 
-WhatsApp only allows the business to message first with an approved template. After the student replies, the 24-hour service window opens and the bot can send the program menu, mode menu, and AI answers.
+WhatsApp only allows the business to message first with an approved template. After the user replies, the 24-hour service window opens and the bot can send the CMA Teach menu and AI answers. The admin-initiated template/menu endpoints still require an enrollment record; open CMA access applies to users who initiate inbound conversations.
 
-Send the first Program menu from the app side:
+Send the enrolled-course mode menu from the app side:
 
 ```bash
-docker compose exec api python scripts/send_whatsapp_program_menu.py 9916039894
+docker compose exec api python scripts/whatsapp/send_whatsapp_program_menu.py "$WHATSAPP_TEST_TO"
 ```
 
 Or call the protected API:
 
 ```bash
 curl -X POST "http://localhost:8000/v1/admin/whatsapp/send-program-menu" \
-  -H "x-admin-token: change-me" \
+  -H "x-admin-token: $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"to":"9916039894"}'
+  -d '{"to":"919999999999"}'
 ```
 
-Students can optionally type a program instead of tapping the list:
-
-```text
-CMA
-CPA
-ACCA
-EA
-```
-
-Students can change the program or learning mode anytime:
+Students can change the CMA learning mode anytime:
 
 ```text
 menu
@@ -288,6 +504,15 @@ menu
 See `.env.example`.
 
 Key settings:
+- `MENTOR_PROVIDER`
+- `MENTOR_FALLBACK_PROVIDER`
+- `MENTOR_POLICY_PROVIDER`
+- `NVIDIA_API_KEY`
+- `NVIDIA_MODEL`
+- `NVIDIA_MAX_TOKENS`
+- `NVIDIA_REASONING_BUDGET`
+- `GEMINI_API_KEY`
+- `GEMINI_MODEL`
 - `ANTHROPIC_API_KEY`
 - `ANTHROPIC_MODEL`
 - `EMBEDDING_PROVIDER`
@@ -295,11 +520,15 @@ Key settings:
 - `OPENAI_EMBEDDING_MODEL`
 - `QDRANT_URL`
 - `REDIS_URL`
+- `QUESTION_ANSWER_FILE`
+- `QUESTION_REPEAT_TTL_SECONDS`
+- `COURSE_RETRIEVAL_ENABLED`
 - `ADMIN_TOKEN`
 - `WHATSAPP_VERIFY_TOKEN`
 - `WHATSAPP_ACCESS_TOKEN`
 - `WHATSAPP_PHONE_NUMBER_ID`
 - `WHATSAPP_APP_SECRET`
+- `WHATSAPP_OPEN_CMA_ACCESS`
 - `MAX_CONTEXT_CHARS`
 - `TOP_K`
 
@@ -334,9 +563,9 @@ Upload these content sets:
 
 ### Job hunt material
 - finance resume templates
-- Big 4 interview Q&A
+- finance interview Q&A
 - FP&A, audit, taxation, controllership JD mapping
-- LinkedIn outreach scripts
+- professional networking outreach scripts
 - salary and role guidance docs
 
 ---
@@ -344,9 +573,14 @@ Upload these content sets:
 ## 8. Production checklist
 
 Before going live:
-- Replace `ADMIN_TOKEN`
+- Set `APP_ENVIRONMENT=production` and generate a long random `ADMIN_TOKEN`; the known example/empty value is rejected
 - Put API behind HTTPS
-- Add user login and role-based access
+- Put `/admin/` behind your identity-aware access gateway; add user login/RBAC when multiple administrators need individual accountability
+- Do not use the quick-tunnel profile as a permanent public deployment
+- Keep Redis and Qdrant on a private network (the development Compose ports bind only to localhost)
+- The API container runs as UID/GID `1000`, with a read-only root filesystem and dropped Linux capabilities; ensure the host `data/` directory is writable by that UID on Linux
+- Back up the stable `ai-mentor-rag-northstar_admin_storage` volume, `data/feedback-media`, the runtime config/prompt files, and Qdrant together; `docker compose down -v` deletes named-volume data
+- Use PostgreSQL/object storage plus a durable worker queue before scaling the API beyond a single node
 - Add content-level permissions by course
 - Store chat history in Postgres
 - Add moderation and PII redaction
@@ -366,10 +600,12 @@ Before going live:
 
 - Stream answers immediately using SSE.
 - Use a compact retrieval context rather than sending full documents to the model.
-- Cache exact normalized questions in Redis.
+- Reuse an approved stage-one answer from `data/question_answers.txt` when another student asks the same normalized course question.
+- Generate fresh, progressively deeper answers on the same student's second and third requests; ask for a precise clarification on the fourth.
+- Keep repetition counters and pending clarification state in Redis without writing student identifiers to the answer file.
 - Keep embeddings precomputed during ingestion.
 - Use Qdrant payload filters for course-specific search.
-- Use local hash embeddings by default so Claude-only deployments can run; switch to `text-embedding-3-small` with `EMBEDDING_PROVIDER=openai` for stronger semantic retrieval.
+- Use local hash embeddings to run without an embedding API; switch to `text-embedding-3-small` with `EMBEDDING_PROVIDER=openai` for stronger semantic retrieval.
 - Keep top-k low by default; increase only after measuring retrieval misses.
 
 ---

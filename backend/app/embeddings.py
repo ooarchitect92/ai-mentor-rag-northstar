@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import math
 import re
@@ -14,9 +15,13 @@ class EmbeddingService:
         self.settings = get_settings()
         self.client = None
         if self.settings.embedding_provider == "openai":
-            if not self.settings.openai_api_key:
+            if not (self.settings.openai_api_key or "").strip():
                 raise RuntimeError("OPENAI_API_KEY is required when EMBEDDING_PROVIDER=openai")
-            self.client = AsyncOpenAI(api_key=self.settings.openai_api_key)
+            self.client = AsyncOpenAI(
+                api_key=self.settings.openai_api_key,
+                timeout=self.settings.request_timeout_seconds,
+                max_retries=0,
+            )
 
     def _hash_embed(self, text: str) -> list[float]:
         vector = [0.0] * self.settings.embedding_dimensions
@@ -36,7 +41,7 @@ class EmbeddingService:
     @retry(wait=wait_exponential(multiplier=0.5, min=1, max=8), stop=stop_after_attempt(3))
     async def embed_one(self, text: str) -> list[float]:
         if self.settings.embedding_provider == "hash":
-            return self._hash_embed(text)
+            return await asyncio.to_thread(self._hash_embed, text)
 
         if self.client is None:
             raise RuntimeError("Embedding client is not configured")
@@ -53,7 +58,7 @@ class EmbeddingService:
         if not texts:
             return []
         if self.settings.embedding_provider == "hash":
-            return [self._hash_embed(text) for text in texts]
+            return await asyncio.to_thread(lambda: [self._hash_embed(text) for text in texts])
 
         if self.client is None:
             raise RuntimeError("Embedding client is not configured")
@@ -64,3 +69,7 @@ class EmbeddingService:
             encoding_format="float",
         )
         return [item.embedding for item in result.data]
+
+    async def aclose(self) -> None:
+        if self.client is not None:
+            await self.client.close()
