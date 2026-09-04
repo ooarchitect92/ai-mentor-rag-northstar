@@ -5,7 +5,7 @@ services:
     env_file:
       - .env
     ports:
-      - "${APP_PORT:-8000}:8000"
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
     volumes:
       - ./data:/app/data
       - admin_storage:/app/state
@@ -46,18 +46,18 @@ services:
       retries: 20
 
   public-tunnel:
-    image: cloudflare/cloudflared:latest
+    image: cloudflare/cloudflared:2026.7.2
     profiles: ["tunnel"]
-    command: tunnel --no-autoupdate --url http://api:8000
+    command: tunnel --no-autoupdate --protocol http2 --url http://api:8000
     restart: unless-stopped
     depends_on:
       api:
         condition: service_healthy
 
   named-tunnel:
-    image: cloudflare/cloudflared:latest
+    image: cloudflare/cloudflared:2026.7.2
     profiles: ["permanent-tunnel"]
-    command: tunnel --no-autoupdate run
+    command: tunnel --no-autoupdate --protocol http2 run
     environment:
       TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
     restart: unless-stopped

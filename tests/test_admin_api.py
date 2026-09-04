@@ -30,9 +30,13 @@ def admin_client(tmp_path, monkeypatch):
     monkeypatch.setenv("WHATSAPP_ACCESS_TOKEN", "test-token")
     monkeypatch.setenv("WHATSAPP_PHONE_NUMBER_ID", "test-phone-id")
     monkeypatch.setenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "test-business-id")
-    monkeypatch.setenv("WHATSAPP_WEBHOOK_CALLBACK_URL", "https://example.test/webhooks/whatsapp")
+    monkeypatch.setenv(
+        "WHATSAPP_WEBHOOK_CALLBACK_URL",
+        "https://mentor.example.test/v1/whatsapp/ziplin/webhook",
+    )
     monkeypatch.setenv("NORTHSTAR_PUBLIC_BASE_URL", "https://mentor.example.test")
     monkeypatch.setenv("WHATSAPP_APP_SECRET", "test-app-secret")
+    monkeypatch.setenv("WHATSAPP_VERIFY_TOKEN", "test-verify-token")
     monkeypatch.setenv("WHATSAPP_RELAY_TOKEN", "test-relay-token-that-is-longer-than-32-characters")
     monkeypatch.setenv("WHATSAPP_OPEN_CMA_ACCESS", "true")
     monkeypatch.setenv("NVIDIA_API_KEY", "test-nvidia-key")
@@ -46,6 +50,35 @@ def admin_client(tmp_path, monkeypatch):
     yield client, {"x-admin-token": "test-admin-token"}
     get_settings.cache_clear()
     whatsapp_module._load_enrollment_workbook.cache_clear()
+
+
+def routed_webhook_payload(message_id: str = "wamid.admin-api") -> dict:
+    return {
+        "object": "whatsapp_business_account",
+        "entry": [
+            {
+                "id": "test-business-id",
+                "changes": [
+                    {
+                        "field": "messages",
+                        "value": {
+                            "metadata": {"phone_number_id": "test-phone-id"},
+                            "contacts": [{"wa_id": "919876543210"}],
+                            "messages": [
+                                {
+                                    "id": message_id,
+                                    "from": "919876543210",
+                                    "timestamp": "1700000000",
+                                    "type": "text",
+                                    "text": {"body": "Hi"},
+                                }
+                            ],
+                        },
+                    }
+                ],
+            }
+        ],
+    }
 
 
 def test_admin_auth_static_dashboard_and_public_feedback_config(admin_client):
@@ -145,15 +178,15 @@ def test_whatsapp_dashboard_master_switch_and_status(admin_client):
     assert status_payload["enabled"] is True
     assert status_payload["open_cma_access"] is True
     assert status_payload["outbound_ready"] is True
-    assert status_payload["webhook_callback_url"] == "https://example.test/webhooks/whatsapp"
+    assert status_payload["webhook_callback_url"] == (
+        "https://mentor.example.test/v1/whatsapp/ziplin/webhook"
+    )
     assert status_payload["direct_callback_path"] == "/v1/whatsapp/ziplin/webhook"
     assert status_payload["relay_path"] == "/v1/whatsapp/ziplin/relay"
-    assert status_payload["delivery_mode"] == "existing_webhook_relay"
+    assert status_payload["delivery_mode"] == "direct_meta"
     assert status_payload["routing_ready"] is True
+    assert status_payload["inbound_ready"] is True
     assert status_payload["stable_ingress_configured"] is True
-    assert status_payload["relay_destination_url"] == (
-        "https://mentor.example.test/v1/whatsapp/ziplin/relay"
-    )
     assert "access_token" not in status_payload
 
     paused = client.put(
@@ -164,7 +197,7 @@ def test_whatsapp_dashboard_master_switch_and_status(admin_client):
     assert paused.status_code == 200, paused.text
     assert paused.json()["enabled"] is False
 
-    webhook_body = json.dumps({"object": "whatsapp_business_account", "entry": []}).encode()
+    webhook_body = json.dumps(routed_webhook_payload("wamid.paused-admin-api")).encode()
     webhook_signature = "sha256=" + hmac.new(b"test-app-secret", webhook_body, hashlib.sha256).hexdigest()
     webhook = client.post(
         "/v1/whatsapp/webhook",
@@ -194,12 +227,17 @@ def test_whatsapp_dashboard_master_switch_and_status(admin_client):
     assert resumed.json()["enabled"] is True
 
 
-def test_public_feedback_is_available_for_a_stable_authenticated_relay(admin_client, monkeypatch):
+def test_public_feedback_is_available_for_a_stable_signed_direct_callback(
+    admin_client, monkeypatch
+):
     client, _headers = admin_client
-    monkeypatch.setenv("WHATSAPP_APP_SECRET", "")
+    monkeypatch.setenv("WHATSAPP_APP_SECRET", "test-app-secret")
     monkeypatch.setenv("META_APP_SECRET", "")
-    monkeypatch.setenv("WHATSAPP_RELAY_TOKEN", "relay-secret-that-is-longer-than-32-characters")
-    monkeypatch.setenv("NORTHSTAR_PUBLIC_BASE_URL", "https://mentor.example.test")
+    monkeypatch.setenv("WHATSAPP_VERIFY_TOKEN", "test-verify-token")
+    monkeypatch.setenv(
+        "WHATSAPP_WEBHOOK_CALLBACK_URL",
+        "https://mentor.example.test/v1/whatsapp/ziplin/webhook",
+    )
     get_settings.cache_clear()
 
     response = client.get("/v1/public/config")
@@ -436,6 +474,7 @@ def test_production_startup_rejects_default_or_missing_secrets(monkeypatch, tmp_
     monkeypatch.setenv("WHATSAPP_ACCESS_TOKEN", "")
     monkeypatch.setenv("WHATSAPP_TOKEN", "")
     monkeypatch.setenv("WHATSAPP_PHONE_NUMBER_ID", "")
+    monkeypatch.setenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "")
     monkeypatch.setenv("WHATSAPP_APP_SECRET", "")
     monkeypatch.setenv("META_APP_SECRET", "")
     monkeypatch.setenv("WHATSAPP_FEEDBACK_NUMBER", "not-a-number")
@@ -454,6 +493,7 @@ def test_production_startup_rejects_default_or_missing_secrets(monkeypatch, tmp_
     assert "E.164" in str(error.value)
     assert "FEEDBACK command marker" in str(error.value)
     assert "GEMINI_API_KEY is required for WhatsApp image questions" in str(error.value)
+    assert "WHATSAPP_BUSINESS_ACCOUNT_ID is required" in str(error.value)
     assert "TRAINING_LEASE_TIMEOUT_SECONDS must be at least 480" in str(error.value)
     assert "WHATSAPP_WEBHOOK_LEASE_TIMEOUT_SECONDS" in str(error.value)
     assert "WHATSAPP_WEBHOOK_MAX_ATTEMPTS" in str(error.value)
@@ -502,7 +542,7 @@ def test_whatsapp_webhook_is_durably_enqueued_before_acceptance(admin_client, mo
     client, _ = admin_client
     scheduled = []
     monkeypatch.setattr(main_module, "schedule_whatsapp_webhook", scheduled.append)
-    payload = {"entry": [{"id": "entry-api", "changes": []}]}
+    payload = routed_webhook_payload("entry-api")
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     signature = "sha256=" + hmac.new(
         b"test-app-secret",
@@ -536,7 +576,7 @@ def test_existing_webhook_can_relay_into_the_same_durable_queue(admin_client, mo
     monkeypatch.setenv("WHATSAPP_RELAY_TOKEN", "relay-secret-that-is-longer-than-32-characters")
     get_settings.cache_clear()
     monkeypatch.setattr(main_module, "schedule_whatsapp_webhook", scheduled.append)
-    payload = {"entry": [{"id": "entry-from-existing-webhook", "changes": []}]}
+    payload = routed_webhook_payload("entry-from-existing-webhook")
 
     unauthorized = client.post("/v1/whatsapp/relay", json=payload)
     assert unauthorized.status_code == 401
@@ -558,30 +598,81 @@ def test_existing_webhook_can_relay_into_the_same_durable_queue(admin_client, mo
     assert "entry-from-existing-webhook" in row["payload"]
 
 
-def test_ziplin_relay_status_requires_a_stable_public_destination(admin_client, monkeypatch):
+def test_ziplin_direct_status_requires_a_stable_callback(admin_client, monkeypatch):
     client, headers = admin_client
-    monkeypatch.setenv("WHATSAPP_RELAY_TOKEN", "relay-secret-that-is-longer-than-32-characters")
-    monkeypatch.setenv("NORTHSTAR_PUBLIC_BASE_URL", "https://mentor.example.test/")
+    monkeypatch.setenv(
+        "WHATSAPP_WEBHOOK_CALLBACK_URL",
+        "https://mentor.example.test/v1/whatsapp/ziplin/webhook",
+    )
+    monkeypatch.setenv("WHATSAPP_VERIFY_TOKEN", "test-verify-token")
+    monkeypatch.setenv("WHATSAPP_APP_SECRET", "test-app-secret")
     get_settings.cache_clear()
 
     payload = client.get("/v1/admin/whatsapp/status", headers=headers).json()
 
-    assert payload["delivery_mode"] == "existing_webhook_relay"
+    assert payload["delivery_mode"] == "direct_meta"
     assert payload["stable_ingress_configured"] is True
     assert payload["routing_ready"] is True
-    assert payload["relay_destination_url"] == (
-        "https://mentor.example.test/v1/whatsapp/ziplin/relay"
-    )
+    assert payload["inbound_ready"] is True
 
     monkeypatch.setenv(
-        "NORTHSTAR_PUBLIC_BASE_URL",
-        "https://temporary-example.trycloudflare.com",
+        "WHATSAPP_WEBHOOK_CALLBACK_URL",
+        "https://temporary-example.trycloudflare.com/v1/whatsapp/ziplin/webhook",
     )
     get_settings.cache_clear()
     temporary = client.get("/v1/admin/whatsapp/status", headers=headers).json()
+    assert temporary["delivery_mode"] == "direct_meta"
     assert temporary["stable_ingress_configured"] is False
     assert temporary["routing_ready"] is False
-    assert temporary["relay_destination_url"] == ""
+    assert temporary["inbound_ready"] is False
+
+
+@pytest.mark.parametrize(
+    ("callback_url", "expected_delivery_mode"),
+    (
+        (
+            "https://mentor.example.test/v1/whatsapp/ziplin/webhook?source=legacy",
+            "misconfigured_legacy_callback",
+        ),
+        (
+            "https://mentor.example.test/V1/WhatsApp/Ziplin/Webhook",
+            "misconfigured_legacy_callback",
+        ),
+        (
+            "https://mentor.example.test/v1/whatsapp/webhook",
+            "misconfigured_legacy_callback",
+        ),
+        (
+            "https://localhost/v1/whatsapp/ziplin/webhook",
+            "direct_meta",
+        ),
+        (
+            "https://10.0.0.4/v1/whatsapp/ziplin/webhook",
+            "direct_meta",
+        ),
+        (
+            "https://mentor.example.test:8443/v1/whatsapp/ziplin/webhook",
+            "direct_meta",
+        ),
+        (
+            "https://[invalid-host/v1/whatsapp/ziplin/webhook",
+            "misconfigured_legacy_callback",
+        ),
+    ),
+)
+def test_ziplin_direct_status_rejects_noncanonical_or_private_callbacks(
+    admin_client, monkeypatch, callback_url, expected_delivery_mode
+):
+    client, headers = admin_client
+    monkeypatch.setenv("WHATSAPP_WEBHOOK_CALLBACK_URL", callback_url)
+    get_settings.cache_clear()
+
+    payload = client.get("/v1/admin/whatsapp/status", headers=headers).json()
+
+    assert payload["delivery_mode"] == expected_delivery_mode
+    assert payload["stable_ingress_configured"] is False
+    assert payload["routing_ready"] is False
+    assert payload["inbound_ready"] is False
 
 
 def test_ziplin_relay_accepts_only_the_configured_phone_number(admin_client, monkeypatch):
@@ -597,17 +688,17 @@ def test_ziplin_relay_accepts_only_the_configured_phone_number(admin_client, mon
             "object": "whatsapp_business_account",
             "entry": [
                 {
-                    "id": "test-waba",
+                    "id": "test-business-id",
                     "changes": [
                         {
                             "field": "messages",
                             "value": {
                                 "metadata": {"phone_number_id": phone_id},
-                                "contacts": [{"wa_id": "919535210826"}],
+                                "contacts": [{"wa_id": "919876543210"}],
                                 "messages": [
                                     {
                                         "id": message_id,
-                                        "from": "919535210826",
+                                        "from": "919876543210",
                                         "timestamp": "1700000000",
                                         "type": "text",
                                         "text": {"body": "Hi"},
@@ -653,9 +744,8 @@ def test_ziplin_direct_webhook_uses_dedicated_alias(admin_client):
             "hub.challenge": "12345",
         },
     )
-    # The fixture does not set a verify token, so the alias must reject the
-    # request through the same verification path as the legacy endpoint.
-    assert verification.status_code == 403
+    assert verification.status_code == 200
+    assert verification.text == "12345"
 
 
 def test_relay_is_closed_when_shared_secret_is_not_configured(admin_client, monkeypatch):
@@ -664,6 +754,24 @@ def test_relay_is_closed_when_shared_secret_is_not_configured(admin_client, monk
     get_settings.cache_clear()
     response = client.post("/v1/whatsapp/relay", json={"entry": []})
     assert response.status_code == 503
+
+
+def test_legacy_relays_are_disabled_in_production_even_with_a_stale_token(
+    admin_client, monkeypatch
+):
+    client, headers = admin_client
+    monkeypatch.setenv("APP_ENVIRONMENT", "production")
+    monkeypatch.setenv(
+        "WHATSAPP_RELAY_TOKEN",
+        "stale-relay-secret-that-is-longer-than-32-characters",
+    )
+    get_settings.cache_clear()
+
+    assert client.post("/v1/whatsapp/relay", json={"entry": []}).status_code == 410
+    assert client.post("/v1/whatsapp/ziplin/relay", json={"entry": []}).status_code == 410
+    status_payload = client.get("/v1/admin/whatsapp/status", headers=headers).json()
+    assert status_payload["relay_configured"] is False
+    assert status_payload["relay_destination_url"] == ""
 
 
 def test_course_helper_preserves_full_international_number_and_saves_workbook(tmp_path):

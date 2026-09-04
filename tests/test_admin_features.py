@@ -1120,8 +1120,9 @@ def test_whatsapp_dedupe_is_committed_only_after_success(monkeypatch):
     monkeypatch.setattr(whatsapp_module, "extract_incoming_messages", lambda payload: [message])
     bot._handle_message = flaky_handler
 
-    with pytest.raises(RuntimeError, match="wamid.retryable"):
+    with pytest.raises(RuntimeError, match="message reference") as failure:
         run(bot.handle_payload({}))
+    assert message.message_id not in str(failure.value)
     assert attempts == 1
     assert f"whatsapp:inbound:done:{message.message_id}" not in cache.values
     assert f"whatsapp:inbound:processing:{message.message_id}" not in cache.values
@@ -1191,6 +1192,16 @@ def test_surviving_cancel_marker_never_false_completes_the_retry(monkeypatch):
 def test_whatsapp_signature_fails_closed_without_secret(monkeypatch):
     monkeypatch.setenv("APP_ENVIRONMENT", "development")
     monkeypatch.setenv("WHATSAPP_USE_MOCK", "false")
+    monkeypatch.setenv("WHATSAPP_APP_SECRET", "")
+    monkeypatch.setenv("META_APP_SECRET", "")
+    get_settings.cache_clear()
+
+    assert verify_meta_signature(b"{}", None) is False
+
+
+def test_mock_outbound_mode_does_not_allow_unsigned_public_webhooks(monkeypatch):
+    monkeypatch.setenv("APP_ENVIRONMENT", "development")
+    monkeypatch.setenv("WHATSAPP_USE_MOCK", "true")
     monkeypatch.setenv("WHATSAPP_APP_SECRET", "")
     monkeypatch.setenv("META_APP_SECRET", "")
     get_settings.cache_clear()

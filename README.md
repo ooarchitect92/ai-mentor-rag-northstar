@@ -4,6 +4,7 @@ A production-oriented starter project for an AI mentor that teaches students usi
 
 ## Documentation map
 
+- [Current architecture and SaaS hardening](docs/ARCHITECTURE_AND_SAAS_HARDENING.md) — runtime topology, data flows, Ziplin state, target design, and migration gates
 - [Project structure](docs/PROJECT_STRUCTURE.md) — ownership and persistence boundaries
 - [Admin operations](docs/ADMIN_OPERATIONS.md) — every dashboard page and workflow
 - [Testing and release checks](docs/TESTING.md) — coverage and deployment gate
@@ -233,51 +234,36 @@ curl -N -X POST "http://localhost:8000/v1/chat/stream" \
 
 The bot uses the official Meta WhatsApp Cloud API webhook flow.
 
-For a legacy non-Ziplin integration where another application owns the Meta
-callback, keep that callback unchanged and forward payloads to
-`POST /v1/whatsapp/relay` using the private `X-Northstar-Relay-Token` header.
-Ziplin deployments should use the dedicated route and header in the next
-section. See `docs/ADMIN_OPERATIONS.md` for Python and Node examples. Direct Meta
-delivery at `/v1/whatsapp/webhook` remains supported.
-Set `WHATSAPP_WEBHOOK_CALLBACK_URL` to the existing permanent callback. In this
-mode `start.bat` validates and preserves that URL. Set
-`NORTHSTAR_PUBLIC_BASE_URL` to this application's permanent HTTPS origin and
-configure the existing webhook owner to forward to the resulting Ziplin relay
-URL. A temporary Cloudflare quick tunnel is useful for a manual test only; its
-hostname changes after a restart and is not production routing.
-
-### Isolated Ziplin number
-
-Use the dedicated paths for a Ziplin deployment so its routing is visibly
-separate from an existing NorthStar application:
-
-- Direct Meta callback: `GET/POST /v1/whatsapp/ziplin/webhook`
-- Authenticated relay: `POST /v1/whatsapp/ziplin/relay`
-- Relay header: `X-Ziplin-Relay-Token: <WHATSAPP_RELAY_TOKEN>`
-
-Relay deployments also require a stable origin:
+Ziplin uses direct Meta delivery; no third-party inbox or webhook relay is part
+of the production path. Publish NorthStar on a permanent HTTPS hostname and set:
 
 ```dotenv
 NORTHSTAR_PUBLIC_BASE_URL=https://mentor.example.com
+WHATSAPP_WEBHOOK_CALLBACK_URL=https://mentor.example.com/v1/whatsapp/ziplin/webhook
+WHATSAPP_APP_SECRET=<Meta App Secret stored only in the deployment secret store>
 ```
 
-The complete Xolox forwarding destination is then
-`https://mentor.example.com/v1/whatsapp/ziplin/relay`.
+`start.bat` validates the callback, registers it on the Ziplin Meta app, checks
+the active subscription, and separately checks the system-user token used for
+outbound replies. A temporary Cloudflare quick tunnel is for non-production
+testing only; its hostname changes after a restart.
 
-Every inbound message is checked against `WHATSAPP_PHONE_NUMBER_ID` before it
-enters the durable queue and again before processing. A payload addressed to a
-different number is acknowledged as `ignored` and can never produce an outbound
+Every signed batch is checked against `WHATSAPP_BUSINESS_ACCOUNT_ID` and
+`WHATSAPP_PHONE_NUMBER_ID` before any part enters the durable queue; the phone
+ID is checked again before message processing. A payload addressed to another
+WABA or number is acknowledged as `ignored` and can never produce an outbound
 reply. Outbound messages are always sent through the configured Phone Number ID.
-Register the dedicated callback only on the Ziplin Meta app; do not replace the
-callback on the existing NorthStar Meta app.
+Register the dedicated callback only on the Ziplin Meta app.
 
-The dashboard Enrollments page includes a WhatsApp operations panel. It shows
+The dashboard includes a read-only Conversations inbox plus a WhatsApp
+operations panel. It shows
 non-sensitive webhook, phone, account, enrollment-source, and durable-queue
 status. Its master switch changes `whatsapp_messaging_enabled` immediately.
-When paused, webhook verification remains available, new payloads are
-acknowledged without being queued, public feedback links are disabled, and all
-outbound WhatsApp sends are blocked. Access tokens and application secrets are
-never returned to the browser.
+When paused, webhook verification remains available, student messages are
+acknowledged without being queued, delivery/read receipts keep the inbox
+current, public feedback links are disabled, and all outbound WhatsApp sends
+are blocked. Access tokens and application secrets are never returned to the
+browser.
 
 Conversation flow:
 
@@ -316,9 +302,8 @@ WHATSAPP_MAX_MEDIA_BYTES=5242880
 ```
 
 The button is enabled only when the feedback number, Cloud API token,
-phone-number ID, and authenticated inbound route are configured. Direct routes
-need the Meta app secret; relay routes need both the relay token and a permanent
-`NORTHSTAR_PUBLIC_BASE_URL`. Browsers cannot pre-attach a local screenshot to a
+phone-number ID, permanent direct callback, verification token, and Meta App
+Secret are configured. Browsers cannot pre-attach a local screenshot to a
 `wa.me` link; the student attaches it inside WhatsApp before sending.
 
 Feedback is accepted before tutoring enrollment checks so a visitor can report a
@@ -346,7 +331,7 @@ Use the `Enrollments` tab with these required columns:
 
 | phone_number | course | active | student_name | notes |
 | --- | --- | --- | --- | --- |
-| 9535210826 | CMA | YES | Student name | Optional note |
+| 9876543210 | CMA | YES | Student name | Optional note |
 
 - `course` must be `CMA`, `CPA`, `CFA`, `ACCA`, `CS`, or `EA`.
 - For a new valid phone number, a blank `course` defaults to `CMA` and a blank
@@ -396,8 +381,8 @@ on file goes dead after each restart.
 `start.bat` handles that by running `scripts/windows/register_webhook.ps1` on every
 launch: it reads the tunnel URL out of the `public-tunnel` logs, waits until the
 API answers `/ready` through it, then re-registers it on the app subscription
-with `object=whatsapp_business_account` and the `messages` field. Existing
-subscribed fields are preserved. Run it by hand any time with:
+with `object=whatsapp_business_account` and the required `messages` field. Run
+it by hand any time with:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\windows\register_webhook.ps1
@@ -434,7 +419,8 @@ WHATSAPP_TEST_TO=
 WHATSAPP_ENROLLMENTS=919999999999:CMA
 ```
 
-`WHATSAPP_TOKEN` and `META_APP_SECRET` are accepted because the Cheerio project archive uses those names. `WHATSAPP_ACCESS_TOKEN` and `WHATSAPP_APP_SECRET` are the equivalent names in this Python app.
+`WHATSAPP_TOKEN` and `META_APP_SECRET` remain backward-compatible aliases.
+Prefer `WHATSAPP_ACCESS_TOKEN` and `WHATSAPP_APP_SECRET` for new deployments.
 
 Assign or change one student's enrolled course through the protected backend API:
 
@@ -457,7 +443,9 @@ Run the WhatsApp diagnostics after changing Meta tokens or IDs:
 docker compose exec api python scripts/whatsapp/whatsapp_diagnostics.py
 ```
 
-All checks should pass before the bot can send or reply through WhatsApp. If `debug_token` passes but `phone_object` fails, the token is valid but is not authorized for the configured `WHATSAPP_PHONE_NUMBER_ID`.
+All checks should pass before the bot can send or reply through WhatsApp. If
+the permission check passes but the configured-phone check fails, the token is
+not authorized for that `WHATSAPP_PHONE_NUMBER_ID`.
 
 Send the first business-initiated "Hi" message from the app side:
 
@@ -527,7 +515,11 @@ Key settings:
 - `WHATSAPP_VERIFY_TOKEN`
 - `WHATSAPP_ACCESS_TOKEN`
 - `WHATSAPP_PHONE_NUMBER_ID`
+- `WHATSAPP_BUSINESS_ACCOUNT_ID`
 - `WHATSAPP_APP_SECRET`
+- `META_APP_ID`
+- `WHATSAPP_WEBHOOK_CALLBACK_URL`
+- `NORTHSTAR_PUBLIC_BASE_URL`
 - `WHATSAPP_OPEN_CMA_ACCESS`
 - `MAX_CONTEXT_CHARS`
 - `TOP_K`

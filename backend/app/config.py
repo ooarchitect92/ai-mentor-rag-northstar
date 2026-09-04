@@ -72,10 +72,9 @@ class Settings(BaseSettings):
     whatsapp_graph_base: str = ""
     whatsapp_business_account_id: str = ""
     whatsapp_webhook_callback_url: str = ""
-    # Stable public origin that the existing Ziplin/Xolox webhook owner can
-    # reach.  A trycloudflare quick-tunnel URL is intentionally not inferred:
-    # it changes after a restart and would make inbound routing look ready when
-    # the external forwarder is still pointing at a dead hostname.
+    # Stable public origin Meta can reach for direct webhook delivery. A
+    # trycloudflare quick-tunnel URL is intentionally not inferred because it
+    # changes after a restart and silently breaks inbound routing.
     northstar_public_base_url: str = ""
     whatsapp_messaging_enabled: bool = True
     # When enabled, every WhatsApp sender receives CMA access without being
@@ -95,8 +94,9 @@ class Settings(BaseSettings):
     whatsapp_webhook_recovery_interval_seconds: int = 15
     whatsapp_webhook_max_attempts: int = 6
     whatsapp_inbound_processing_ttl_seconds: int = 300
-    # Shared secret used only when an existing webhook service relays Meta
-    # payloads to this application. It is never exposed through public config.
+    whatsapp_message_retention_days: int = 90
+    # Legacy development/test compatibility secret. Relay endpoints are always
+    # disabled in production and this value is never exposed through public config.
     whatsapp_relay_token: str = ""
     feedback_media_directory: str = "data/feedback-media"
     feedback_max_per_sender_per_day: int = 10

@@ -6,14 +6,16 @@ operator supplies --send-template and an explicit recipient.
 
 import argparse
 import asyncio
+import ipaddress
 import os
 import sys
-import time
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
 import httpx
 from dotenv import load_dotenv
+
+from app.whatsapp import WhatsAppClient
 
 
 @dataclass(frozen=True)
@@ -24,14 +26,44 @@ class Check:
     required: bool = True
 
 
+def callback_state(value: str):
+    """Apply the same canonical Ziplin callback rules as the backend."""
+    try:
+        parsed = urlparse(value)
+        hostname = (parsed.hostname or "").rstrip(".").casefold()
+        supported_port = parsed.port in {None, 443}
+    except ValueError:
+        return urlparse(""), False, False, ""
+    direct = bool(
+        parsed.path == "/v1/whatsapp/ziplin/webhook"
+        and not parsed.params
+        and not parsed.query
+        and not parsed.fragment
+    )
+    dns_hostname = bool(hostname and "." in hostname)
+    try:
+        ipaddress.ip_address(hostname)
+        dns_hostname = False
+    except ValueError:
+        dns_hostname = (
+            dns_hostname
+            and hostname != "localhost"
+            and not hostname.endswith((".localhost", ".local"))
+        )
+    stable = bool(
+        parsed.scheme.casefold() == "https"
+        and dns_hostname
+        and supported_port
+        and not parsed.username
+        and not parsed.password
+        and not hostname.endswith(".trycloudflare.com")
+    )
+    return parsed, direct, stable, hostname
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate the live Ziplin WhatsApp integration.")
     parser.add_argument("--public-base-url", default="")
-    parser.add_argument(
-        "--probe-relay",
-        action="store_true",
-        help="Queue a harmless status-only event through the public relay.",
-    )
     parser.add_argument(
         "--send-template",
         action="store_true",
@@ -64,10 +96,9 @@ async def call(
         if not isinstance(error, dict):
             error = {}
         detail = f"HTTP {response.status_code}"
-        if error.get("code") is not None:
-            detail += f", code {error['code']}"
-        if error.get("message"):
-            detail += f": {str(error['message'])[:200]}"
+        code = error.get("code")
+        if isinstance(code, int) and not isinstance(code, bool):
+            detail += f", code {code}"
         return Check(name, False, detail), body
     return Check(name, True, f"HTTP {response.status_code}"), body
 
@@ -86,8 +117,7 @@ async def run() -> int:
     app_id = os.getenv("META_APP_ID") or os.getenv("FACEBOOK_APP_ID") or ""
     app_secret = os.getenv("WHATSAPP_APP_SECRET") or os.getenv("META_APP_SECRET") or ""
     verify_token = os.getenv("WHATSAPP_VERIFY_TOKEN") or ""
-    relay_token = os.getenv("WHATSAPP_RELAY_TOKEN") or ""
-    callback_url = (os.getenv("WHATSAPP_WEBHOOK_CALLBACK_URL") or "").rstrip("/")
+    callback_url = os.getenv("WHATSAPP_WEBHOOK_CALLBACK_URL") or ""
     public_base = (
         args.public_base_url or os.getenv("NORTHSTAR_PUBLIC_BASE_URL") or ""
     ).rstrip("/")
@@ -98,12 +128,28 @@ async def run() -> int:
     template_name = os.getenv("WHATSAPP_START_TEMPLATE_NAME") or "hello_world"
     template_language = os.getenv("WHATSAPP_START_TEMPLATE_LANGUAGE") or "en_US"
 
+    callback, direct_callback, stable_callback, callback_hostname = callback_state(
+        callback_url
+    )
+    if not public_base and stable_callback:
+        public_base = f"{callback.scheme}://{callback.netloc}".rstrip("/")
+
     checks = [
         Check("outbound access token configured", bool(token), "present" if token else "missing"),
         Check("Phone Number ID configured", bool(phone_id), "present" if phone_id else "missing"),
         Check("WABA ID configured", bool(waba_id), "present" if waba_id else "missing"),
         Check("webhook verification token configured", bool(verify_token), "present" if verify_token else "missing"),
-        Check("Ziplin relay token configured", bool(relay_token), "present" if relay_token else "missing"),
+        Check("Meta App Secret configured", bool(app_secret), "present" if app_secret else "missing"),
+        Check(
+            "direct Ziplin callback configured",
+            direct_callback,
+            "canonical direct path" if direct_callback else "expected /v1/whatsapp/ziplin/webhook",
+        ),
+        Check(
+            "permanent HTTPS callback hostname",
+            stable_callback,
+            callback_hostname or "missing",
+        ),
     ]
     if not token or not phone_id:
         for check in checks:
@@ -166,6 +212,29 @@ async def run() -> int:
                 )
             checks.append(waba_check)
 
+            if app_id:
+                subscription_check, body = await call(
+                    client,
+                    "configured Meta app subscribed to WABA",
+                    "GET",
+                    f"{graph_base}/{waba_id}/subscribed_apps",
+                    headers=auth,
+                )
+                if subscription_check.ok:
+                    subscribed_app_ids = {
+                        str((item.get("whatsapp_business_api_data") or {}).get("id") or "")
+                        for item in body.get("data") or []
+                        if isinstance(item, dict)
+                    }
+                    subscription_check = Check(
+                        subscription_check.name,
+                        subscribed_app_ids == {app_id},
+                        "only the configured Ziplin app is subscribed"
+                        if subscribed_app_ids == {app_id}
+                        else "configured app absent or an unexpected app is also subscribed",
+                    )
+                checks.append(subscription_check)
+
             query = str(httpx.QueryParams({"fields": "name,status,language", "name": template_name}))
             template_check, body = await call(
                 client,
@@ -189,25 +258,44 @@ async def run() -> int:
             checks.append(template_check)
 
         if app_id and app_secret:
-            query = str(
-                httpx.QueryParams(
-                    {"input_token": token, "access_token": f"{app_id}|{app_secret}"}
+            app_auth = {"Authorization": f"Bearer {app_id}|{app_secret}"}
+            subscription_check, body = await call(
+                client,
+                "Meta app direct webhook subscription",
+                "GET",
+                f"{graph_base}/{app_id}/subscriptions",
+                headers=app_auth,
+            )
+            if subscription_check.ok:
+                subscriptions = [
+                    item
+                    for item in body.get("data") or []
+                    if isinstance(item, dict)
+                    and item.get("object") == "whatsapp_business_account"
+                ]
+                matched_subscription = next(
+                    (
+                        item
+                        for item in subscriptions
+                        if str(item.get("callback_url") or "") == callback_url
+                    ),
+                    None,
                 )
-            )
-            app_check, body = await call(
-                client, "Meta token app ownership", "GET", f"{graph_base}/debug_token?{query}"
-            )
-            if app_check.ok:
-                data = body.get("data") or {}
-                matched = bool(data.get("is_valid")) and str(data.get("app_id") or "") == app_id
-                app_check = Check(
-                    app_check.name,
+                field_names = {
+                    str(field.get("name") if isinstance(field, dict) else field)
+                    for field in (matched_subscription or {}).get("fields") or []
+                }
+                matched = matched_subscription is not None and "messages" in field_names
+                subscription_check = Check(
+                    subscription_check.name,
                     matched,
-                    "valid and app matched" if matched else "invalid or belongs to another app",
+                    "configured callback and messages field are active"
+                    if matched
+                    else "callback differs, is absent, or lacks the messages field",
                 )
-            checks.append(app_check)
+            checks.append(subscription_check)
         else:
-            checks.append(Check("Meta app ownership", True, "app secret unavailable in relay mode", False))
+            checks.append(Check("Meta app direct webhook subscription", False, "app ID or App Secret missing"))
 
         if callback_url and verify_token:
             challenge = "ZIPLIN_WEBHOOK_OK"
@@ -225,39 +313,13 @@ async def run() -> int:
                 ok = response.status_code == 200 and response.text == challenge
                 checks.append(
                     Check(
-                        "existing Xolox callback challenge",
+                        "direct NorthStar callback challenge",
                         ok,
                         "challenge echoed" if ok else f"HTTP {response.status_code}; mismatch",
                     )
                 )
             except Exception as exc:
-                checks.append(Check("existing Xolox callback challenge", False, type(exc).__name__))
-
-        callback_path = urlparse(callback_url).path.rstrip("/").lower()
-        relay_mode = bool(
-            callback_url
-            and not callback_path.endswith(
-                ("/v1/whatsapp/webhook", "/v1/whatsapp/ziplin/webhook")
-            )
-        )
-        if relay_mode:
-            public_origin = urlparse(public_base)
-            stable_public_origin = bool(
-                public_origin.scheme == "https"
-                and public_origin.hostname
-                and not public_origin.hostname.casefold().endswith(".trycloudflare.com")
-            )
-            checks.append(
-                Check(
-                    "stable public Ziplin relay origin",
-                    stable_public_origin,
-                    (
-                        public_base
-                        if stable_public_origin
-                        else "a permanent HTTPS NORTHSTAR_PUBLIC_BASE_URL is missing"
-                    ),
-                )
-            )
+                checks.append(Check("direct NorthStar callback challenge", False, type(exc).__name__))
 
         if public_base:
             ready_check, body = await call(
@@ -271,73 +333,31 @@ async def run() -> int:
                 )
             checks.append(ready_check)
 
-            if args.probe_relay:
-                relay_check, body = await call(
-                    client,
-                    "authenticated public Ziplin relay",
-                    "POST",
-                    f"{public_base}/v1/whatsapp/ziplin/relay",
-                    headers={"X-Ziplin-Relay-Token": relay_token},
-                    payload={
-                        "object": "whatsapp_business_account",
-                        "entry": [
-                            {
-                                "id": waba_id,
-                                "changes": [
-                                    {
-                                        "field": "messages",
-                                        "value": {
-                                            "metadata": {"phone_number_id": phone_id},
-                                            "statuses": [
-                                                {
-                                                    "id": f"wamid.ziplin-diagnostic.{time.time_ns()}",
-                                                    "status": "read",
-                                                    "recipient_id": "000000000000",
-                                                }
-                                            ],
-                                        },
-                                    }
-                                ],
-                            }
-                        ],
-                    },
-                )
-                if relay_check.ok:
-                    relay_check = Check(
-                        relay_check.name,
-                        body.get("status") == "accepted",
-                        str(body.get("status") or "unexpected response"),
-                    )
-                checks.append(relay_check)
-
         if args.send_template:
             recipient = args.recipient or os.getenv("WHATSAPP_TEST_TO") or ""
             digits = "".join(character for character in recipient if character.isdigit())
             if not digits:
                 checks.append(Check("explicit template send", False, "recipient is missing"))
             else:
-                send_check, body = await call(
-                    client,
-                    "explicit template send",
-                    "POST",
-                    f"{graph_base}/{phone_id}/messages",
-                    headers={**auth, "Content-Type": "application/json"},
-                    payload={
-                        "messaging_product": "whatsapp",
-                        "to": digits,
-                        "type": "template",
-                        "template": {
-                            "name": template_name,
-                            "language": {"code": template_language},
-                        },
-                    },
-                )
-                if send_check.ok:
+                try:
+                    body = await WhatsAppClient().send_start_message(
+                        to=digits,
+                        template_name=template_name,
+                        language_code=template_language,
+                    )
                     accepted = bool(body.get("messages"))
                     send_check = Check(
-                        send_check.name,
+                        "explicit template send through NorthStar",
                         accepted,
-                        "accepted by Meta" if accepted else "Meta returned no message ID",
+                        "accepted by Meta and handed to conversation persistence"
+                        if accepted
+                        else "Meta returned no message ID",
+                    )
+                except Exception as exc:
+                    send_check = Check(
+                        "explicit template send through NorthStar",
+                        False,
+                        type(exc).__name__,
                     )
                 checks.append(send_check)
 

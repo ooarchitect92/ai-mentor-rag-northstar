@@ -50,11 +50,18 @@ class UnsupportedFeedbackMediaError(RuntimeError):
     """A permanent screenshot validation error that should not be retried."""
 
 
+class WhatsAppMediaDownloadError(RuntimeError):
+    """A sanitized media-provider failure safe for durable queues and logs."""
+
+
 class WhatsAppInboundBusyError(RuntimeError):
     """A duplicate delivery is waiting for an earlier message attempt to expire."""
 
     def __init__(self, message_id: str, retry_after_seconds: int) -> None:
-        super().__init__(f"WhatsApp message is still processing: {message_id}")
+        super().__init__(
+            "WhatsApp message is still processing (reference "
+            f"{_log_reference(message_id)})"
+        )
         self.retry_after_seconds = retry_after_seconds
 
 
@@ -778,7 +785,7 @@ async def get_enrolled_courses(
                     raise
                 logger.exception(
                     "Could not migrate legacy Redis enrollment to Excel sender=%s",
-                    normalized_sender,
+                    _masked_log_phone(normalized_sender),
                 )
                 return set()
             await cache.delete(enrollment_key(normalized_sender))
@@ -941,7 +948,9 @@ def verify_meta_signature(raw_body: bytes, signature_header: str | None) -> bool
     settings = get_settings()
     app_secret = settings.whatsapp_app_secret or settings.meta_app_secret
     if not app_secret:
-        return settings.whatsapp_use_mock or settings.app_environment == "test"
+        # Unsigned payloads are allowed only inside the explicit test
+        # environment. Mock outbound mode must never weaken a public ingress.
+        return settings.app_environment.casefold() == "test"
 
     if not signature_header or not signature_header.startswith("sha256="):
         return False
@@ -1206,6 +1215,63 @@ def build_chat_request(
     )
 
 
+def _outbound_message_summary(payload: dict[str, Any]) -> tuple[str, str, bool]:
+    """Return display-safe fields without retaining the Graph request payload."""
+    message_type = str(payload.get("type") or "unknown").strip().casefold()[:40]
+    if not message_type or any(
+        not (character.isalnum() or character in {"_", "-"})
+        for character in message_type
+    ):
+        message_type = "unknown"
+    body = ""
+    has_media = message_type in {"audio", "document", "image", "sticker", "video"}
+    content = payload.get(message_type) or {}
+    if not isinstance(content, dict):
+        content = {}
+    if message_type == "text":
+        body = str(content.get("body") or "")
+    elif message_type == "template":
+        name = str(content.get("name") or "").strip()
+        language = content.get("language") or {}
+        language_code = (
+            str(language.get("code") or "").strip()
+            if isinstance(language, dict)
+            else ""
+        )
+        body = f"Template: {name}" if name else "Template message"
+        if language_code:
+            body += f" ({language_code})"
+    elif message_type == "interactive":
+        parts: list[str] = []
+        header = content.get("header") or {}
+        if isinstance(header, dict) and header.get("text"):
+            parts.append(str(header["text"]))
+        interactive_body = content.get("body") or {}
+        if isinstance(interactive_body, dict) and interactive_body.get("text"):
+            parts.append(str(interactive_body["text"]))
+        body = "\n".join(parts) or "Interactive message"
+    elif message_type in {"document", "image", "video"}:
+        body = str(content.get("caption") or "")
+    body = body.replace("\x00", "")
+    body = "".join(
+        character
+        for character in body
+        if character in {"\n", "\t"} or ord(character) >= 32
+    ).strip()[:6000]
+    return message_type, body, has_media
+
+
+def _log_reference(value: Any) -> str:
+    """Return a stable correlation value without logging provider IDs or PII."""
+    text = str(value or "")
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12] if text else "missing"
+
+
+def _masked_log_phone(value: Any) -> str:
+    digits = "".join(character for character in str(value or "") if character.isdigit())
+    return f"***{digits[-4:]}" if digits else "missing"
+
+
 class WhatsAppClient:
     def __init__(self) -> None:
         self.settings = get_settings()
@@ -1231,23 +1297,51 @@ class WhatsAppClient:
 
         headers = {"Authorization": f"Bearer {self._token()}"}
         async with httpx.AsyncClient(timeout=self.settings.request_timeout_seconds) as client:
-            metadata_response = await client.get(f"{self._graph_base()}/{media_id}", headers=headers)
-            metadata_response.raise_for_status()
-            metadata = metadata_response.json()
-            media_url = str(metadata.get("url") or "")
-            mime_type = str(metadata.get("mime_type") or "application/octet-stream").lower()
-            declared_size = int(metadata.get("file_size") or 0)
+            metadata_response = None
+            try:
+                metadata_response = await client.get(
+                    f"{self._graph_base()}/{media_id}", headers=headers
+                )
+                metadata_response.raise_for_status()
+                metadata = metadata_response.json()
+                if not isinstance(metadata, dict):
+                    raise ValueError("invalid metadata shape")
+                media_url = str(metadata.get("url") or "")
+                mime_type = str(
+                    metadata.get("mime_type") or "application/octet-stream"
+                ).lower()
+                declared_size = int(metadata.get("file_size") or 0)
+            except Exception:
+                logger.warning(
+                    "WhatsApp media metadata request failed media_ref=%s status=%s",
+                    _log_reference(media_id),
+                    getattr(metadata_response, "status_code", None),
+                )
+                raise WhatsAppMediaDownloadError(
+                    "WhatsApp media metadata request failed"
+                ) from None
 
             if not media_url:
-                raise RuntimeError("WhatsApp media URL is missing")
+                raise WhatsAppMediaDownloadError("WhatsApp media metadata was incomplete")
             if not mime_type.startswith("image/"):
                 raise UnsupportedFeedbackMediaError("Only image screenshots are supported")
             if declared_size > self.settings.whatsapp_max_media_bytes:
                 raise UnsupportedFeedbackMediaError("WhatsApp image exceeds the configured size limit")
 
-            media_response = await client.get(media_url, headers=headers)
-            media_response.raise_for_status()
-            image_bytes = media_response.content
+            media_response = None
+            try:
+                media_response = await client.get(media_url, headers=headers)
+                media_response.raise_for_status()
+                image_bytes = media_response.content
+            except Exception:
+                logger.warning(
+                    "WhatsApp media content request failed media_ref=%s status=%s",
+                    _log_reference(media_id),
+                    getattr(media_response, "status_code", None),
+                )
+                raise WhatsAppMediaDownloadError(
+                    "WhatsApp media content request failed"
+                ) from None
 
         if not image_bytes:
             raise UnsupportedFeedbackMediaError("WhatsApp image download was empty")
@@ -1261,7 +1355,11 @@ class WhatsAppClient:
         if not get_settings().whatsapp_messaging_enabled:
             raise RuntimeError("WhatsApp messaging is paused from the admin dashboard")
         if self.settings.whatsapp_use_mock:
-            logger.info("[Mock WhatsApp] %s", payload)
+            logger.info(
+                "[Mock WhatsApp] type=%s recipient=%s",
+                payload.get("type"),
+                _masked_log_phone(payload.get("to")),
+            )
             return {"mock": True, "payload": payload}
 
         if not self.configured:
@@ -1279,29 +1377,72 @@ class WhatsAppClient:
                     error = (response.json() or {}).get("error") or {}
                 except ValueError:
                     error = {}
-                code = error.get("code")
-                error_type = error.get("type")
-                message = error.get("message") or response.reason_phrase
+                code = error.get("code") if isinstance(error.get("code"), int) else None
+                error_subcode = (
+                    error.get("error_subcode")
+                    if isinstance(error.get("error_subcode"), int)
+                    else None
+                )
+                raw_error_type = error.get("type")
+                error_type = (
+                    raw_error_type
+                    if isinstance(raw_error_type, str)
+                    and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", raw_error_type)
+                    else "unknown"
+                )
                 logger.error(
-                    "WhatsApp send rejected status=%s code=%s type=%s message=%s",
+                    "WhatsApp send rejected status=%s code=%s subcode=%s type=%s transient=%s trace_ref=%s",
                     response.status_code,
                     code,
+                    error_subcode,
                     error_type,
-                    message,
+                    error.get("is_transient") is True,
+                    _log_reference(error.get("fbtrace_id")),
                 )
                 raise RuntimeError(
-                    f"Meta rejected the WhatsApp reply (HTTP {response.status_code}, code {code}): {message}"
-                )
+                    f"Meta rejected the WhatsApp reply (HTTP {response.status_code}, code {code})"
+                ) from None
             try:
                 result = response.json()
             except ValueError:
                 result = {"raw": response.text}
 
+        # A successful Graph response is the first point at which a genuine
+        # outbound Meta message ID exists. Persistence is deliberately best
+        # effort here: raising after Meta accepted the send would make the
+        # durable inbound worker retry and could duplicate the student reply.
+        try:
+            accepted_messages = result.get("messages") if isinstance(result, dict) else None
+            if isinstance(accepted_messages, list):
+                message_type, body, has_media = _outbound_message_summary(payload)
+                store = AdminStore()
+                for accepted in accepted_messages:
+                    if not isinstance(accepted, dict):
+                        continue
+                    meta_message_id = str(accepted.get("id") or "").strip()
+                    if not meta_message_id:
+                        continue
+                    await store.record_whatsapp_outbound_message(
+                        business_phone_number_id=self.settings.whatsapp_phone_number_id,
+                        meta_message_id=meta_message_id,
+                        contact_phone=str(payload.get("to") or ""),
+                        message_type=message_type,
+                        body=body,
+                        has_media=has_media,
+                        status="accepted",
+                    )
+        except Exception:
+            logger.exception(
+                "WhatsApp send was accepted but its conversation record could not be persisted type=%s to=%s",
+                payload.get("type"),
+                _masked_log_phone(payload.get("to")),
+            )
+
         logger.info(
-            "WhatsApp send accepted type=%s to=%s response=%s",
+            "WhatsApp send accepted type=%s to=%s accepted_count=%s",
             payload.get("type"),
-            payload.get("to"),
-            result,
+            _masked_log_phone(payload.get("to")),
+            len(accepted_messages) if isinstance(accepted_messages, list) else 0,
         )
         return result
 
@@ -1491,7 +1632,7 @@ class WhatsAppBot:
                         store=feedback_store,
                     )
                 except (UnsupportedFeedbackMediaError, ValueError):
-                    logger.exception("Could not save WhatsApp feedback screenshot message=%s", message.message_id)
+                    logger.exception("Could not save WhatsApp feedback screenshot message_ref=%s", _log_reference(message.message_id))
                     await feedback_store.set_feedback_session(
                         normalized_sender,
                         "awaiting_submission",
@@ -1504,7 +1645,7 @@ class WhatsAppBot:
                     )
                     return True
                 except Exception:
-                    logger.exception("Transient WhatsApp feedback screenshot failure message=%s", message.message_id)
+                    logger.exception("Transient WhatsApp feedback screenshot failure message_ref=%s", _log_reference(message.message_id))
                     raise
                 return True
             if marked_description:
@@ -1516,14 +1657,14 @@ class WhatsAppBot:
                         store=feedback_store,
                     )
                 except ValueError:
-                    logger.exception("Could not save WhatsApp text feedback message=%s", message.message_id)
+                    logger.exception("Could not save WhatsApp text feedback message_ref=%s", _log_reference(message.message_id))
                     await self.client.send_text(
                         message.sender,
                         "I could not accept that feedback because its daily or storage limit was reached.",
                     )
                     return True
                 except Exception:
-                    logger.exception("Transient WhatsApp text feedback failure message=%s", message.message_id)
+                    logger.exception("Transient WhatsApp text feedback failure message_ref=%s", _log_reference(message.message_id))
                     raise
                 return True
             await feedback_store.set_feedback_session(
@@ -1550,7 +1691,7 @@ class WhatsAppBot:
                     store=feedback_store,
                 )
             except (UnsupportedFeedbackMediaError, ValueError):
-                logger.exception("Could not save WhatsApp feedback screenshot message=%s", message.message_id)
+                logger.exception("Could not save WhatsApp feedback screenshot message_ref=%s", _log_reference(message.message_id))
                 await self.client.send_text(
                     message.sender,
                     "I could not save that screenshot. Please send a JPG or PNG under "
@@ -1558,7 +1699,7 @@ class WhatsAppBot:
                 )
                 return True
             except Exception:
-                logger.exception("Transient WhatsApp feedback screenshot failure message=%s", message.message_id)
+                logger.exception("Transient WhatsApp feedback screenshot failure message_ref=%s", _log_reference(message.message_id))
                 raise
             return True
         if incoming:
@@ -1570,14 +1711,14 @@ class WhatsAppBot:
                     store=feedback_store,
                 )
             except ValueError:
-                logger.exception("Could not save WhatsApp text feedback message=%s", message.message_id)
+                logger.exception("Could not save WhatsApp text feedback message_ref=%s", _log_reference(message.message_id))
                 await self.client.send_text(
                     message.sender,
                     "I could not accept that feedback because its daily or storage limit was reached.",
                 )
                 return True
             except Exception:
-                logger.exception("Transient WhatsApp text feedback failure message=%s", message.message_id)
+                logger.exception("Transient WhatsApp text feedback failure message_ref=%s", _log_reference(message.message_id))
                 raise
             return True
         await self.client.send_text(message.sender, "Please type your feedback or attach a JPG or PNG screenshot.")
@@ -1588,58 +1729,58 @@ class WhatsAppBot:
         for event in extract_status_events(payload):
             if event.errors:
                 logger.warning(
-                    "WhatsApp status %s for message=%s recipient=%s errors=%s",
+                    "WhatsApp status %s for message_ref=%s recipient=%s error_count=%s",
                     event.status,
-                    event.message_id,
-                    event.recipient_id,
-                    event.errors,
+                    _log_reference(event.message_id),
+                    _masked_log_phone(event.recipient_id),
+                    len(event.errors),
                 )
             else:
                 logger.info(
-                    "WhatsApp status %s for message=%s recipient=%s conversation=%s",
+                    "WhatsApp status %s for message_ref=%s recipient=%s conversation_ref=%s",
                     event.status,
-                    event.message_id,
-                    event.recipient_id,
-                    event.conversation_id,
+                    _log_reference(event.message_id),
+                    _masked_log_phone(event.recipient_id),
+                    _log_reference(event.conversation_id),
                 )
 
         for message in extract_incoming_messages(payload):
             configured_phone_id = self.settings.whatsapp_phone_number_id.strip()
             if configured_phone_id and message.phone_number_id != configured_phone_id:
-                # A single Meta/Xolox callback can receive events for several
-                # business phone numbers. Never let this bot answer an event
-                # addressed to another number. Meta includes phone_number_id on
-                # every genuine Cloud API message event; a missing ID is accepted
-                # only by explicit mock/test configurations.
+                # A Meta app callback can receive events for several business
+                # phone numbers. Never let this bot answer an event addressed
+                # to another number. Meta includes phone_number_id on every
+                # genuine Cloud API message event; a missing ID is accepted only
+                # by explicit mock/test configurations.
                 if message.phone_number_id or not (
                     self.settings.whatsapp_use_mock
                     or self.settings.app_environment == "test"
                 ):
                     logger.warning(
-                        "WhatsApp inbound ignored for non-configured phone message=%s target_phone_id=%s configured_phone_id=%s",
-                        message.message_id,
-                        message.phone_number_id or "missing",
-                        configured_phone_id,
+                        "WhatsApp inbound ignored for non-configured phone message_ref=%s target_phone_ref=%s configured_phone_ref=%s",
+                        _log_reference(message.message_id),
+                        _log_reference(message.phone_number_id),
+                        _log_reference(configured_phone_id),
                     )
                     continue
             logger.info(
-                "WhatsApp inbound message=%s sender=%s target_phone_id=%s type=%s has_media=%s",
-                message.message_id,
-                message.sender,
-                message.phone_number_id or "missing",
+                "WhatsApp inbound message_ref=%s sender=%s target_phone_ref=%s type=%s has_media=%s",
+                _log_reference(message.message_id),
+                _masked_log_phone(message.sender),
+                _log_reference(message.phone_number_id),
                 message.message_type,
                 bool(message.media_id),
             )
             dedupe_key = f"whatsapp:inbound:done:{message.message_id}"
             processing_key = f"whatsapp:inbound:processing:{message.message_id}"
             if await self.cache.get_text(dedupe_key):
-                logger.info("WhatsApp duplicate skipped message=%s", message.message_id)
+                logger.info("WhatsApp duplicate skipped message_ref=%s", _log_reference(message.message_id))
                 continue
             if not await self.cache.set_if_absent(
                 processing_key,
                 ttl_seconds=self.settings.whatsapp_inbound_processing_ttl_seconds,
             ):
-                logger.info("WhatsApp duplicate already processing message=%s", message.message_id)
+                logger.info("WhatsApp duplicate already processing message_ref=%s", _log_reference(message.message_id))
                 # Do not report success to the durable queue: a previous worker may
                 # have died before clearing this marker. Retry after its TTL instead.
                 raise WhatsAppInboundBusyError(
@@ -1655,7 +1796,7 @@ class WhatsAppBot:
                 await asyncio.shield(self.cache.delete(processing_key))
                 raise
             except Exception:
-                logger.exception("Failed to process WhatsApp message %s", message.message_id)
+                logger.exception("Failed to process WhatsApp message_ref=%s", _log_reference(message.message_id))
                 # The durable webhook queue retries transient media, storage, or provider failures.
                 await self.cache.delete(processing_key)
                 failed_messages.append(message.message_id)
@@ -1664,7 +1805,8 @@ class WhatsAppBot:
                 await self.cache.delete(processing_key)
         if failed_messages:
             raise RuntimeError(
-                "WhatsApp processing failed for message(s): " + ", ".join(failed_messages)
+                "WhatsApp processing failed for message reference(s): "
+                + ", ".join(_log_reference(value) for value in failed_messages)
             )
 
     async def _handle_message(self, message: WhatsAppIncomingMessage) -> None:
@@ -1844,16 +1986,19 @@ class WhatsAppBot:
                 )
                 incoming = extracted[:5800]
                 logger.info(
-                    "WhatsApp image extracted message=%s sender=%s course=%s mime=%s bytes=%s chars=%s",
-                    message.message_id,
-                    message.sender,
+                    "WhatsApp image extracted message_ref=%s sender=%s course=%s mime=%s bytes=%s chars=%s",
+                    _log_reference(message.message_id),
+                    _masked_log_phone(message.sender),
                     selected_course,
                     mime_type,
                     len(image_bytes),
                     len(incoming),
                 )
             except Exception:
-                logger.exception("Failed to process WhatsApp image %s", message.media_id)
+                logger.exception(
+                    "Failed to process WhatsApp image media_ref=%s",
+                    _log_reference(message.media_id),
+                )
                 await self.client.send_text(
                     message.sender,
                     "I could not read that screenshot. Please send a clear JPG or PNG image, or type the course question.",
@@ -1908,9 +2053,9 @@ class WhatsAppBot:
                 response = await mentor.answer(chat_request)
             answer = format_whatsapp_answer(response.answer, selected_course, selected_option)
             logger.info(
-                "WhatsApp mentor answer ready message=%s sender=%s course=%s chars=%s refused=%s",
-                message.message_id,
-                message.sender,
+                "WhatsApp mentor answer ready message_ref=%s sender=%s course=%s chars=%s refused=%s",
+                _log_reference(message.message_id),
+                _masked_log_phone(message.sender),
                 selected_course,
                 len(response.answer),
                 response.answer
@@ -1922,7 +2067,10 @@ class WhatsAppBot:
             )
         except Exception:
             usage_status = "error"
-            logger.exception("Mentor answer failed for WhatsApp sender %s", message.sender)
+            logger.exception(
+                "Mentor answer failed for WhatsApp sender %s",
+                _masked_log_phone(message.sender),
+            )
             answer = "I had trouble generating that answer right now. Please try again in a moment."
         finally:
             closer = getattr(mentor, "aclose", None)

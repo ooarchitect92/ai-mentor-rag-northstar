@@ -12,6 +12,7 @@ const ROUTES = {
   knowledge: { title: "Knowledge", eyebrow: "Content library" },
   training: { title: "Training", eyebrow: "RAG operations" },
   feedback: { title: "Feedback", eyebrow: "Student voice" },
+  conversations: { title: "Conversations", eyebrow: "WhatsApp inbox" },
   enrollments: { title: "Enrollments", eyebrow: "WhatsApp access" },
   analytics: { title: "Analytics", eyebrow: "Student usage" },
   activity: { title: "Activity", eyebrow: "Audit trail" },
@@ -79,6 +80,7 @@ const state = {
   jobs: [],
   approvedAnswers: [],
   feedback: [],
+  conversations: [],
   configuration: null,
   enrollment: null,
   enrollmentRoster: [],
@@ -90,6 +92,7 @@ const state = {
   selectedDocumentIds: new Set(),
   knowledgeFilters: { search: "", course: "", status: "" },
   feedbackFilters: { search: "", category: "", status: "" },
+  conversationFilters: { search: "" },
   activityFilters: { search: "" },
   pages: {
     knowledge: { limit: PAGE_LIMIT, offset: 0, total: 0, count: 0 },
@@ -97,9 +100,15 @@ const state = {
     trainingJobs: { limit: PAGE_LIMIT, offset: 0, total: 0, count: 0 },
     approvedAnswers: { limit: PAGE_LIMIT, offset: 0, total: 0, count: 0 },
     feedback: { limit: PAGE_LIMIT, offset: 0, total: 0, count: 0 },
+    conversations: { limit: PAGE_LIMIT, offset: 0, total: 0, count: 0 },
     activity: { limit: PAGE_LIMIT, offset: 0, total: 0, count: 0 },
   },
   trainingPoll: null,
+  conversationPoll: null,
+  conversationsRenderedSignature: "",
+  conversationFocusTarget: null,
+  activeConversationId: null,
+  activeConversationSignature: "",
 };
 
 class ApiError extends Error {
@@ -202,10 +211,14 @@ function paginationMarkup(pageKey, itemLabel) {
 
 function bindPagination(root = document) {
   root.querySelectorAll("[data-page-key]").forEach((button) => button.addEventListener("click", () => {
-    const page = state.pages[button.dataset.pageKey];
+    const pageKey = button.dataset.pageKey;
+    const page = state.pages[pageKey];
     if (!page) return;
     const delta = button.dataset.pageDirection === "next" ? page.limit : -page.limit;
     page.offset = Math.max(0, page.offset + delta);
+    if (pageKey === "conversations") {
+      state.conversationFocusTarget = { type: "page", direction: button.dataset.pageDirection };
+    }
     loadRoute();
   }));
 }
@@ -322,6 +335,9 @@ function openDialog({ title, eyebrow = "", content, onOpen }) {
 function closeDialog() {
   if (elements.dialog.open) elements.dialog.close();
   elements.dialogBody.innerHTML = "";
+  elements.dialog.classList.remove("dialog--conversation");
+  state.activeConversationId = null;
+  state.activeConversationSignature = "";
 }
 
 function confirmAction({ title, message, confirmLabel = "Confirm", danger = false }) {
@@ -458,6 +474,21 @@ function stopTrainingPoll() {
   state.trainingPoll = null;
 }
 
+function stopConversationPoll() {
+  window.clearTimeout(state.conversationPoll);
+  state.conversationPoll = null;
+}
+
+function conversationPollAllowed() {
+  return state.authenticated && state.route === "conversations" && document.visibilityState === "visible";
+}
+
+function scheduleConversationPoll() {
+  stopConversationPoll();
+  if (!conversationPollAllowed()) return;
+  state.conversationPoll = window.setTimeout(pollConversationInbox, 10000);
+}
+
 async function loadRoute(force = false) {
   if (!state.authenticated) return;
   const requested = location.hash.slice(1);
@@ -466,19 +497,30 @@ async function loadRoute(force = false) {
     history.replaceState(null, "", `#${route}`);
   }
   state.route = route;
+  if (route !== "conversations") state.conversationFocusTarget = null;
   if (force && route !== "overview") state.overview = null;
   state.sequence += 1;
   const sequence = state.sequence;
   stopTrainingPoll();
+  stopConversationPoll();
+  if (route !== "conversations" && state.activeConversationId) closeDialog();
   setActiveNavigation(route);
   elements.viewRoot.innerHTML = loadingMarkup();
   setProgress(true);
+  let routeConnectionHealthy = true;
 
   try {
     if (route === "overview") await loadOverview(sequence, force);
     if (route === "knowledge") await loadKnowledge(sequence);
     if (route === "training") await loadTraining(sequence);
     if (route === "feedback") await loadFeedback(sequence);
+    if (route === "conversations") {
+      await loadConversations(sequence);
+      if (state.activeConversationId && elements.dialog.open) {
+        routeConnectionHealthy = await refreshConversationThread(state.activeConversationId, { silent: true });
+      }
+      scheduleConversationPoll();
+    }
     if (route === "enrollments") {
       const [roster, whatsappStatus] = await Promise.all([
         apiRequest("/whatsapp/enrollments?limit=200&offset=0"),
@@ -495,7 +537,7 @@ async function loadRoute(force = false) {
     if (route === "analytics") await loadAnalytics(sequence);
     if (route === "activity") await loadActivity(sequence);
     if (route === "configuration") await loadConfiguration(sequence);
-    if (sequence === state.sequence) updateTimestamp();
+    if (sequence === state.sequence && routeConnectionHealthy) updateTimestamp();
   } catch (error) {
     if (sequence === state.sequence) renderRouteError(error);
   } finally {
@@ -1293,6 +1335,347 @@ function openFeedbackEditor(item) {
   });
 }
 
+function conversationsQuery() {
+  const page = state.pages.conversations;
+  const query = new URLSearchParams({ limit: String(page.limit), offset: String(page.offset) });
+  const search = state.conversationFilters.search.trim().slice(0, 200);
+  if (search) query.set("search", search);
+  return query.toString();
+}
+
+function safeConversationMessage(message) {
+  const value = message && typeof message === "object" ? message : {};
+  return {
+    id: String(value.id || ""),
+    direction: value.direction === "outbound" ? "outbound" : "inbound",
+    messageType: String(value.message_type || "unknown"),
+    text: String(value.text || ""),
+    hasMedia: value.has_media === true,
+    status: String(value.status || ""),
+    createdAt: value.created_at || null,
+    statusAt: value.status_at || null,
+  };
+}
+
+function conversationsSignature(total, items) {
+  return JSON.stringify({
+    total: Number(total) || 0,
+    offset: state.pages.conversations.offset,
+    items: items.map((item) => ({
+      id: String(item.id || ""),
+      displayName: String(item.display_name || ""),
+      maskedPhone: String(item.masked_phone || ""),
+      messageCount: Number(item.message_count) || 0,
+      lastMessage: safeConversationMessage(item.last_message),
+    })),
+  });
+}
+
+async function loadConversations(sequence = state.sequence, { polling = false } = {}) {
+  const payload = await apiRequest(`/whatsapp/conversations?${conversationsQuery()}`);
+  if (sequence !== state.sequence || state.route !== "conversations") return;
+  state.conversations = Array.isArray(payload.items) ? payload.items : [];
+  if (!applyPageResult("conversations", payload.total ?? state.conversations.length, state.conversations.length)) {
+    await loadConversations(sequence, { polling });
+    return;
+  }
+  const signature = conversationsSignature(state.pages.conversations.total, state.conversations);
+  const searchHasFocus = document.activeElement?.id === "conversation-search";
+  if (!polling || (signature !== state.conversationsRenderedSignature && !searchHasFocus)) {
+    renderConversations(state.pages.conversations.total);
+  }
+}
+
+function conversationPreview(message) {
+  const safe = safeConversationMessage(message);
+  const direction = safe.direction === "outbound" ? "You: " : "";
+  if (safe.hasMedia || safe.messageType === "image") {
+    return `${direction}Image${safe.text ? ` — ${safe.text}` : ""}`;
+  }
+  return `${direction}${safe.text || humanize(safe.messageType) || "Message"}`;
+}
+
+function renderConversations(total) {
+  const search = state.conversationFilters.search;
+  const hasSearch = Boolean(search.trim());
+  const activeElement = document.activeElement;
+  const focusedRow = activeElement?.closest?.("[data-conversation-open]");
+  const focusedPageButton = activeElement?.closest?.('[data-page-key="conversations"]');
+  const focusTarget = focusedRow
+    ? { type: "row", id: focusedRow.dataset.conversationOpen }
+    : activeElement?.matches?.('[data-action="refresh-conversations"]')
+      ? { type: "refresh" }
+      : focusedPageButton
+        ? { type: "page", direction: focusedPageButton.dataset.pageDirection }
+        : state.conversationFocusTarget;
+  state.conversationFocusTarget = null;
+  const rows = state.conversations.map((item) => {
+    const id = String(item.id || "");
+    const name = item.display_name || item.profile_name || "WhatsApp student";
+    const maskedPhone = item.masked_phone || "Masked number unavailable";
+    const lastMessage = safeConversationMessage(item.last_message);
+    return `
+      <button class="conversation-row" type="button" data-conversation-open="${escapeHtml(id)}" aria-label="Open conversation with ${escapeHtml(name)}">
+        <span class="conversation-row__avatar" aria-hidden="true">${icon("message")}</span>
+        <span class="conversation-row__main">
+          <span class="conversation-row__heading"><strong>${escapeHtml(name)}</strong><time>${escapeHtml(formatDate(lastMessage.createdAt))}</time></span>
+          <span class="conversation-row__phone">${escapeHtml(maskedPhone)}</span>
+          <span class="conversation-row__preview">${escapeHtml(truncate(conversationPreview(item.last_message), 150))}</span>
+        </span>
+        <span class="conversation-row__count">${formatNumber(item.message_count)} message${Number(item.message_count) === 1 ? "" : "s"}</span>
+        <span class="conversation-row__arrow" aria-hidden="true">${icon("arrow")}</span>
+      </button>`;
+  }).join("");
+
+  elements.viewRoot.innerHTML = `
+    <header class="section-heading">
+      <div><span class="eyebrow">WhatsApp inbox</span><h2>Conversations</h2><p>Review the protected inbound and outbound timeline for the configured Ziplin number. This inbox is view-only.</p></div>
+      <div class="section-heading__actions"><button class="button button--secondary" type="button" data-action="refresh-conversations">${icon("refresh")}<span>Refresh inbox</span></button></div>
+    </header>
+    <section class="panel conversation-panel">
+      <div class="toolbar">
+        <label class="toolbar__search"><span class="sr-only">Search conversations</span>${icon("search")}<input id="conversation-search" type="search" value="${escapeHtml(search)}" placeholder="Search name or masked number…" autocomplete="off" maxlength="200"></label>
+        <span class="toolbar__count">${formatNumber(total)} conversation${Number(total) === 1 ? "" : "s"}</span>
+      </div>
+      <div class="conversation-list">
+        ${rows || emptyMarkup(hasSearch ? "No matching conversations" : "No conversations yet", hasSearch ? "Try a broader search or clear the current search." : "Messages for the configured Ziplin number will appear after genuine inbound or outbound activity.", hasSearch ? '<button class="button button--secondary" type="button" data-action="clear-conversation-search">Clear search</button>' : "")}
+      </div>
+      ${paginationMarkup("conversations", "Conversations")}
+    </section>`;
+  state.conversationsRenderedSignature = conversationsSignature(total, state.conversations);
+
+  const runSearch = debounce((value) => {
+    state.conversationFilters.search = String(value || "").trim().slice(0, 200);
+    state.conversationFocusTarget = { type: "search" };
+    resetPage("conversations");
+    loadRoute();
+  }, 350);
+  elements.viewRoot.querySelector("#conversation-search")?.addEventListener("input", (event) => runSearch(event.target.value));
+  elements.viewRoot.querySelector('[data-action="clear-conversation-search"]')?.addEventListener("click", () => {
+    state.conversationFilters.search = "";
+    state.conversationFocusTarget = { type: "search" };
+    resetPage("conversations");
+    loadRoute();
+  });
+  elements.viewRoot.querySelector('[data-action="refresh-conversations"]')?.addEventListener("click", (event) => {
+    refreshConversationInbox(event.currentTarget);
+  });
+  elements.viewRoot.querySelectorAll("[data-conversation-open]").forEach((button) => button.addEventListener("click", () => {
+    openConversationThread(button.dataset.conversationOpen);
+  }));
+  bindPagination(elements.viewRoot);
+
+  let focusElement = null;
+  if (focusTarget?.type === "search") {
+    focusElement = elements.viewRoot.querySelector("#conversation-search");
+  } else if (focusTarget?.type === "refresh") {
+    focusElement = elements.viewRoot.querySelector('[data-action="refresh-conversations"]');
+  } else if (focusTarget?.type === "page") {
+    focusElement = [...elements.viewRoot.querySelectorAll('[data-page-key="conversations"]')]
+      .find((button) => button.dataset.pageDirection === focusTarget.direction);
+  } else if (focusTarget?.type === "row") {
+    focusElement = [...elements.viewRoot.querySelectorAll("[data-conversation-open]")]
+      .find((button) => button.dataset.conversationOpen === focusTarget.id);
+    if (!focusElement) focusElement = elements.viewRoot.querySelector("#conversation-search");
+  }
+  if (focusElement?.disabled) {
+    focusElement = [...elements.viewRoot.querySelectorAll('[data-page-key="conversations"]')]
+      .find((button) => !button.disabled) || elements.viewRoot.querySelector("#conversation-search");
+  }
+  focusElement?.focus({ preventScroll: true });
+  if (focusTarget?.type === "search" && focusElement instanceof HTMLInputElement) {
+    focusElement.setSelectionRange(focusElement.value.length, focusElement.value.length);
+  }
+}
+
+function conversationThreadSignature(payload) {
+  const conversation = payload?.conversation || {};
+  const messages = Array.isArray(payload?.items) ? payload.items : [];
+  return JSON.stringify({
+    conversation: {
+      id: String(conversation.id || ""),
+      displayName: String(conversation.display_name || ""),
+      maskedPhone: String(conversation.masked_phone || ""),
+    },
+    total: Number(payload?.total) || 0,
+    messages: messages.map(safeConversationMessage),
+  });
+}
+
+function conversationMessageMarkup(rawMessage) {
+  const message = safeConversationMessage(rawMessage);
+  const image = message.hasMedia || message.messageType === "image";
+  const statusLabel = message.status ? humanize(message.status) : (message.direction === "outbound" ? "Sent" : "Received");
+  const statusTime = message.statusAt && message.statusAt !== message.createdAt
+    ? `<span>Status updated ${escapeHtml(formatDate(message.statusAt))}</span>`
+    : "";
+  return `
+    <article class="conversation-message conversation-message--${message.direction}">
+      <div class="conversation-message__label"><span>${message.direction === "outbound" ? "NorthStar" : "Student"}</span><span>${escapeHtml(humanize(message.messageType))}</span></div>
+      <div class="conversation-message__bubble">
+        ${image ? `<div class="conversation-message__media">${icon("image")}<span>Image attachment hidden</span></div>` : ""}
+        ${message.text ? `<p>${escapeHtml(message.text)}</p>` : (!image ? `<p class="muted">${escapeHtml(humanize(message.messageType))} message</p>` : "")}
+      </div>
+      <footer class="conversation-message__meta"><time>${escapeHtml(formatDate(message.createdAt))}</time><span>${escapeHtml(statusLabel)}</span>${statusTime}</footer>
+    </article>`;
+}
+
+function renderConversationThread(payload, { preserveScroll = false, restoreActionFocus = false } = {}) {
+  const conversation = payload?.conversation || {};
+  const messages = Array.isArray(payload?.items) ? payload.items : [];
+  const existing = elements.dialogBody.querySelector(".conversation-thread__messages");
+  const restoreMessageFocus = existing?.contains(document.activeElement) === true;
+  const restoreRefreshFocus = restoreActionFocus
+    || document.activeElement?.matches?.('[data-action="refresh-conversation-thread"]') === true;
+  const previousScrollTop = existing?.scrollTop || 0;
+  const nearBottom = !existing || existing.scrollHeight - existing.scrollTop - existing.clientHeight < 80;
+  const title = conversation.display_name || conversation.profile_name || "WhatsApp conversation";
+  elements.dialogTitle.textContent = title;
+  elements.dialogEyebrow.textContent = "Protected WhatsApp timeline";
+  elements.dialogEyebrow.hidden = false;
+  elements.dialogBody.innerHTML = `
+    <section class="conversation-thread" aria-label="Conversation history">
+      <div class="conversation-thread__summary">
+        <span><strong>${escapeHtml(conversation.masked_phone || "Masked number unavailable")}</strong><small>${formatNumber(payload?.total)} message${Number(payload?.total) === 1 ? "" : "s"}</small></span>
+        <button class="button button--secondary button--small" type="button" data-action="refresh-conversation-thread">${icon("refresh")}<span>Refresh</span></button>
+      </div>
+      ${Number(payload?.total) > messages.length ? `<p class="conversation-thread__limit">Showing the latest ${formatNumber(messages.length)} of ${formatNumber(payload.total)} messages.</p>` : ""}
+      <div class="conversation-thread__messages" role="region" aria-label="Messages in chronological order" tabindex="0">
+        ${messages.length ? messages.map(conversationMessageMarkup).join("") : emptyMarkup("No messages yet", "This protected conversation does not contain any displayable messages.")}
+      </div>
+      <p class="conversation-thread__privacy">View-only · Phone numbers stay masked · Attachments and provider metadata are not exposed.</p>
+    </section>`;
+  state.activeConversationSignature = conversationThreadSignature(payload);
+  const messagePane = elements.dialogBody.querySelector(".conversation-thread__messages");
+  if (messagePane) {
+    if (!preserveScroll || nearBottom) messagePane.scrollTop = messagePane.scrollHeight;
+    else messagePane.scrollTop = previousScrollTop;
+  }
+  elements.dialogBody.querySelector('[data-action="refresh-conversation-thread"]')?.addEventListener("click", (event) => {
+    refreshConversationThreadFromControl(event.currentTarget);
+  });
+  if (restoreMessageFocus) {
+    messagePane?.focus({ preventScroll: true });
+  } else if (restoreRefreshFocus) {
+    elements.dialogBody.querySelector('[data-action="refresh-conversation-thread"]')?.focus({ preventScroll: true });
+  }
+}
+
+function renderConversationThreadError(error) {
+  elements.dialogBody.innerHTML = `
+    <div class="error-state conversation-thread__error" role="alert">
+      <div class="state-content">
+        <span class="state-icon">${icon("alert")}</span>
+        <h3>Conversation unavailable</h3>
+        <p>${escapeHtml(error.message || "The conversation could not be loaded.")}</p>
+        <button class="button button--secondary" type="button" data-action="retry-conversation-thread">${icon("refresh")}<span>Try again</span></button>
+      </div>
+    </div>`;
+  const retryButton = elements.dialogBody.querySelector('[data-action="retry-conversation-thread"]');
+  retryButton?.addEventListener("click", (event) => {
+    refreshConversationThreadFromControl(event.currentTarget);
+  });
+  retryButton?.focus({ preventScroll: true });
+}
+
+async function refreshConversationThreadFromControl(button) {
+  const healthy = await refreshConversationThread(state.activeConversationId, { button });
+  if (healthy && state.authenticated && state.route === "conversations") updateTimestamp();
+}
+
+async function refreshConversationThread(conversationId, { silent = false, button = null } = {}) {
+  if (!conversationId) return true;
+  const restoreActionFocus = Boolean(button && document.activeElement === button);
+  setButtonBusy(button, true);
+  try {
+    const payload = await apiRequest(`/whatsapp/conversations/${encodeURIComponent(conversationId)}/messages?limit=100&offset=0`);
+    if (state.activeConversationId !== conversationId || !elements.dialog.open) return true;
+    const signature = conversationThreadSignature(payload);
+    if (!silent || signature !== state.activeConversationSignature) {
+      renderConversationThread(payload, { preserveScroll: silent, restoreActionFocus });
+    }
+    return true;
+  } catch (error) {
+    if (error.status === 401) {
+      closeDialog();
+      signOut("Your admin session is no longer valid. Sign in again.");
+      return false;
+    }
+    if (state.activeConversationId !== conversationId || !elements.dialog.open) return true;
+    if (error.status === 404) {
+      closeDialog();
+      elements.connectionLabel.textContent = "Conversation unavailable";
+      showToast("Conversation closed", "It is no longer available in the protected inbox.", "error");
+      return false;
+    }
+    elements.connectionLabel.textContent = error.status === 0 ? "Thread unavailable" : "Thread update failed";
+    if (!silent) renderConversationThreadError(error);
+    return false;
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
+function openConversationThread(conversationId) {
+  const summary = state.conversations.find((item) => String(item.id) === String(conversationId));
+  state.activeConversationId = String(conversationId || "");
+  state.activeConversationSignature = "";
+  openDialog({
+    title: summary?.display_name || summary?.profile_name || "WhatsApp conversation",
+    eyebrow: "Protected WhatsApp timeline",
+    content: `<div class="conversation-thread__loading">${loadingMarkup()}</div>`,
+  });
+  elements.dialog.classList.add("dialog--conversation");
+  refreshConversationThread(state.activeConversationId);
+}
+
+async function refreshConversationInbox(button = null) {
+  const sequence = state.sequence;
+  let threadConnectionHealthy = true;
+  if (button && document.activeElement === button) {
+    state.conversationFocusTarget = { type: "refresh" };
+  }
+  setButtonBusy(button, true);
+  try {
+    await loadConversations(sequence);
+    if (state.activeConversationId && elements.dialog.open) {
+      threadConnectionHealthy = await refreshConversationThread(state.activeConversationId);
+    }
+    if (sequence === state.sequence && state.route === "conversations" && threadConnectionHealthy) updateTimestamp();
+  } catch (error) {
+    if (error.status === 401) signOut("Your admin session is no longer valid. Sign in again.");
+    else {
+      elements.connectionLabel.textContent = error.status === 0 ? "Inbox unavailable" : "Inbox update failed";
+      showToast("Inbox refresh failed", error.message, "error");
+    }
+  } finally {
+    setButtonBusy(button, false);
+    if (button?.isConnected && state.conversationFocusTarget?.type === "refresh") {
+      state.conversationFocusTarget = null;
+      button.focus({ preventScroll: true });
+    }
+    scheduleConversationPoll();
+  }
+}
+
+async function pollConversationInbox() {
+  if (!conversationPollAllowed()) return;
+  const sequence = state.sequence;
+  let threadConnectionHealthy = true;
+  try {
+    await loadConversations(sequence, { polling: true });
+    if (state.activeConversationId && elements.dialog.open) {
+      threadConnectionHealthy = await refreshConversationThread(state.activeConversationId, { silent: true });
+    }
+    if (sequence === state.sequence && conversationPollAllowed() && threadConnectionHealthy) updateTimestamp();
+  } catch (error) {
+    if (error.status === 401) signOut("Your admin session is no longer valid. Sign in again.");
+    else elements.connectionLabel.textContent = "Inbox update failed";
+  } finally {
+    if (sequence === state.sequence) scheduleConversationPoll();
+  }
+}
+
 function auditDetailsText(details) {
   if (!details || typeof details !== "object" || Array.isArray(details)) return "No additional details";
   const entries = Object.entries(details);
@@ -1702,8 +2085,10 @@ function renderEnrollments() {
   const whatsapp = state.whatsappStatus || {};
   const queue = whatsapp.queue?.counts || {};
   const enabled = whatsapp.enabled === true;
-  const inboundHealthy = whatsapp.routing_ready === true && whatsapp.recent_inbound === true;
+  const directMode = whatsapp.delivery_mode === "direct_meta";
+  const inboundHealthy = directMode && whatsapp.routing_ready === true && whatsapp.recent_inbound === true;
   const callback = whatsapp.webhook_callback_url || "Not configured in this deployment";
+  const directCallback = whatsapp.direct_callback_path || "/v1/whatsapp/ziplin/webhook";
   const rosterRows = state.enrollmentRoster.map((item) => `<tr><td><strong>${escapeHtml(item.phone)}</strong></td><td>${(item.courses || []).map((course) => `<span class="badge">${escapeHtml(course)}</span>`).join(" ")}</td><td>${escapeHtml(enrollmentSourceCopy(item.source))}</td><td><button class="button button--ghost button--small" type="button" data-open-enrollment="${escapeHtml(item.phone)}">Manage</button></td></tr>`).join("");
   elements.viewRoot.innerHTML = `
     <header class="section-heading">
@@ -1719,22 +2104,21 @@ function renderEnrollments() {
           <div class="status-tile"><span>Completed / dead letter</span><strong>${formatNumber(queue.completed || 0)}</strong><small>${formatNumber(queue.dead_letter || 0)} need attention</small></div>
         </div>
         <dl class="definition-list whatsapp-definition-list">
-          <div><dt>Webhook callback</dt><dd>${escapeHtml(callback)}</dd></div>
-          <div><dt>Delivery mode</dt><dd>${escapeHtml(whatsapp.delivery_mode === "existing_webhook_relay" ? "Existing webhook relay" : "Direct Meta webhook")}</dd></div>
-          <div><dt>Ziplin direct callback</dt><dd>${escapeHtml(whatsapp.direct_callback_path || "/v1/whatsapp/ziplin/webhook")}</dd></div>
-          <div><dt>Ziplin relay target</dt><dd>${escapeHtml(whatsapp.relay_path || "/v1/whatsapp/ziplin/relay")}</dd></div>
-          <div><dt>Public relay destination</dt><dd>${escapeHtml(whatsapp.relay_destination_url || "No stable public URL configured")}</dd></div>
+          <div><dt>Configured Meta callback</dt><dd>${escapeHtml(callback)}</dd></div>
+          <div><dt>Delivery target</dt><dd>${directMode ? "Direct Meta webhook" : "Direct Meta migration required"}</dd></div>
+          <div><dt>Required Ziplin endpoint</dt><dd>${escapeHtml(directCallback)}</dd></div>
+          <div><dt>Public HTTPS origin</dt><dd>${escapeHtml(whatsapp.public_base_url || "No stable public URL configured")}</dd></div>
           <div><dt>Bot display number</dt><dd>${escapeHtml(whatsapp.feedback_number ? `+${whatsapp.feedback_number}` : "Not configured")}</dd></div>
           <div><dt>Phone number ID</dt><dd>${escapeHtml(whatsapp.phone_number_id || "Not configured")}</dd></div>
           <div><dt>CMA access</dt><dd>${whatsapp.open_cma_access ? "Open to every sender" : "Enrollment required"}</dd></div>
           <div><dt>Business account ID</dt><dd>${escapeHtml(whatsapp.business_account_id || "Not configured")}</dd></div>
           <div><dt>Graph API</dt><dd>${escapeHtml(whatsapp.graph_api_version || "Not configured")}</dd></div>
-          <div><dt>Authentication</dt><dd>Token ${whatsapp.access_token_configured ? "configured" : "missing"} · signature ${whatsapp.signature_configured ? "configured" : "missing"} · relay ${whatsapp.relay_configured ? "configured" : "not configured"}</dd></div>
+          <div><dt>Authentication</dt><dd>Token ${whatsapp.access_token_configured ? "configured" : "missing"} · Meta signature ${whatsapp.signature_configured ? "configured" : "missing"}</dd></div>
           <div><dt>Defaults</dt><dd>${escapeHtml(whatsapp.default_course || "—")} · ${escapeHtml(humanize(whatsapp.default_mode || "—"))} · ${escapeHtml(humanize(whatsapp.default_level || "—"))}</dd></div>
           <div><dt>Enrollment source</dt><dd>${escapeHtml(enrollmentSourceCopy(whatsapp.enrollment_source || state.enrollmentSource))}</dd></div>
           <div><dt>Latest event</dt><dd>${whatsapp.queue?.latest_event ? `${escapeHtml(humanize(whatsapp.queue.latest_event.status))} · ${escapeHtml(formatDate(whatsapp.queue.latest_event.updated_at))}` : "No webhook events recorded"}</dd></div>
         </dl>
-        <div class="notice ${enabled && inboundHealthy ? "" : "notice--error"}">${icon(enabled && inboundHealthy ? "info" : "alert")}<span>${!enabled ? "Messaging is paused. Webhook verification remains available, but new messages are not queued and outbound sends are blocked." : whatsapp.delivery_mode === "existing_webhook_relay" && !whatsapp.stable_ingress_configured ? "Ziplin relay authentication is configured, but there is no stable public destination. Set NORTHSTAR_PUBLIC_BASE_URL to a permanent HTTPS origin; quick-tunnel hostnames change after a restart." : !whatsapp.routing_ready && whatsapp.delivery_mode === "existing_webhook_relay" ? "The existing webhook is not connected to Ziplin. Configure the same WHATSAPP_RELAY_TOKEN in both applications and forward only Ziplin payloads to the public relay destination with X-Ziplin-Relay-Token." : !whatsapp.routing_ready ? "The direct Ziplin Meta webhook is missing verification or signature configuration." : whatsapp.delivery_mode === "existing_webhook_relay" && !whatsapp.recent_inbound ? `The Ziplin relay is configured, but no genuine inbound message arrived recently. Configure Xolox to forward only Phone Number ID ${escapeHtml(whatsapp.phone_number_id || "configured for Ziplin")} to the public relay destination.` : !whatsapp.recent_inbound ? "The direct Ziplin webhook is configured, but no genuine inbound message has arrived recently. Send a test message before treating the route as live." : "Ziplin messaging is active and a genuine inbound message has reached this isolated bot. Outbound credentials are present; Meta permissions must still be valid."}</span></div>
+        <div class="notice ${enabled && inboundHealthy ? "" : "notice--error"}">${icon(enabled && inboundHealthy ? "info" : "alert")}<span>${!enabled ? "Messaging is paused. Student messages are discarded and outbound sends are blocked; delivery and read receipts continue updating the protected inbox." : !directMode ? `This deployment targets direct Meta delivery. Point the Ziplin Meta app callback at the permanent HTTPS origin plus ${escapeHtml(directCallback)} and remove the legacy callback before treating inbound as live.` : !whatsapp.stable_ingress_configured ? "Direct Meta delivery needs a permanent HTTPS origin. Configure NORTHSTAR_PUBLIC_BASE_URL and a named tunnel or managed ingress; quick-tunnel hostnames are not production routing." : !whatsapp.signature_configured ? "Direct Meta delivery is missing the Ziplin Meta app secret required to verify X-Hub-Signature-256." : !whatsapp.routing_ready ? "The direct Ziplin Meta webhook is missing its verification-token configuration." : !whatsapp.recent_inbound ? "The direct Ziplin webhook is configured, but no genuine inbound message has arrived recently. Send a test message before treating the route as live." : "Ziplin messaging is active and a genuine Meta webhook has reached this isolated bot. Outbound credentials are present; Meta permissions must still be monitored."}</span></div>
       </div>
     </section>
     <div class="enrollment-layout">
@@ -1908,6 +2292,7 @@ async function revokeEnrollmentCourse(course, button) {
 function showLogin(message = "") {
   state.authenticated = false;
   stopTrainingPoll();
+  stopConversationPoll();
   closeDialog();
   elements.app.hidden = true;
   elements.loginView.hidden = false;
@@ -1936,6 +2321,11 @@ function signOut(message = "") {
   state.documents = [];
   state.jobs = [];
   state.feedback = [];
+  state.conversations = [];
+  state.conversationsRenderedSignature = "";
+  state.conversationFocusTarget = null;
+  state.activeConversationId = null;
+  state.activeConversationSignature = "";
   state.auditEvents = [];
   state.configuration = null;
   state.enrollment = null;
@@ -2001,9 +2391,18 @@ function bindApplicationEvents() {
   document.querySelectorAll("[data-route]").forEach((button) => button.addEventListener("click", () => navigate(button.dataset.route)));
   window.addEventListener("hashchange", () => loadRoute());
   window.addEventListener("resize", () => { if (window.innerWidth > 960) closeMobileNavigation(); });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState !== "visible") stopConversationPoll();
+    else if (state.route === "conversations") scheduleConversationPoll();
+  });
   elements.dialogClose.addEventListener("click", closeDialog);
   elements.dialog.addEventListener("click", (event) => { if (event.target === elements.dialog) closeDialog(); });
-  elements.dialog.addEventListener("close", () => { elements.dialogBody.innerHTML = ""; });
+  elements.dialog.addEventListener("close", () => {
+    elements.dialogBody.innerHTML = "";
+    elements.dialog.classList.remove("dialog--conversation");
+    state.activeConversationId = null;
+    state.activeConversationSignature = "";
+  });
 }
 
 async function initialize() {

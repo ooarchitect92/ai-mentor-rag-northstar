@@ -13,13 +13,13 @@ from app.admin_store import AdminStore
 from app.config import get_settings
 from app.main import app
 from app.schemas import ChatResponse
-from app.whatsapp import WhatsAppClient
+from app.whatsapp import WhatsAppClient, WhatsAppMediaDownloadError
 
 
 ZIPLIN_PHONE_ID = "ziplin-phone-id"
 ZIPLIN_RELAY_TOKEN = "ziplin-relay-token-that-is-at-least-32-characters"
 ZIPLIN_APP_SECRET = "ziplin-test-app-secret"
-STUDENT_NUMBER = "919535210826"
+STUDENT_NUMBER = "919876543210"
 UNKNOWN_STUDENT_NUMBER = "919999990123"
 
 
@@ -37,6 +37,7 @@ def ziplin_client(tmp_path, monkeypatch):
     monkeypatch.setenv("WHATSAPP_ACCESS_TOKEN", "ziplin-access-token")
     monkeypatch.setenv("WHATSAPP_TOKEN", "")
     monkeypatch.setenv("WHATSAPP_PHONE_NUMBER_ID", ZIPLIN_PHONE_ID)
+    monkeypatch.setenv("WHATSAPP_BUSINESS_ACCOUNT_ID", "ziplin-waba")
     monkeypatch.setenv("WHATSAPP_GRAPH_BASE", "https://graph.example.test/v25.0")
     monkeypatch.setenv("WHATSAPP_RELAY_TOKEN", ZIPLIN_RELAY_TOKEN)
     monkeypatch.setenv("WHATSAPP_OPEN_CMA_ACCESS", "false")
@@ -240,9 +241,7 @@ def test_outbound_client_posts_to_ziplin_phone_id_with_bearer_auth(
         StubResponse(200, response_payload),
     )
 
-    result = asyncio.run(
-        WhatsAppClient().send_text("+91 95352 10826", "Ziplin outbound test")
-    )
+    result = asyncio.run(WhatsAppClient().send_text(STUDENT_NUMBER, "Ziplin outbound test"))
 
     assert result == response_payload
     assert calls == [
@@ -265,7 +264,7 @@ def test_outbound_client_posts_to_ziplin_phone_id_with_bearer_auth(
 
 
 @pytest.mark.parametrize(
-    ("response", "expected"),
+    ("response", "expected", "provider_detail"),
     [
         (
             StubResponse(
@@ -279,7 +278,8 @@ def test_outbound_client_posts_to_ziplin_phone_id_with_bearer_auth(
                 },
                 reason_phrase="Bad Request",
             ),
-            "HTTP 400, code 131030.*Recipient phone number not in allowed list",
+            "HTTP 400, code 131030",
+            "Recipient phone number not in allowed list",
         ),
         (
             StubResponse(
@@ -288,7 +288,8 @@ def test_outbound_client_posts_to_ziplin_phone_id_with_bearer_auth(
                 text="upstream unavailable",
                 reason_phrase="Service Unavailable",
             ),
-            "HTTP 503, code None.*Service Unavailable",
+            "HTTP 503, code None",
+            "Service Unavailable",
         ),
     ],
     ids=["meta-json-error", "non-json-error"],
@@ -298,12 +299,16 @@ def test_outbound_client_surfaces_meta_errors(
     monkeypatch,
     response,
     expected,
+    provider_detail,
+    caplog,
 ):
     calls = install_recording_http_client(monkeypatch, response)
 
-    with pytest.raises(RuntimeError, match=expected):
+    with pytest.raises(RuntimeError, match=expected) as failure:
         asyncio.run(WhatsAppClient().send_text(STUDENT_NUMBER, "This will fail"))
 
+    assert provider_detail not in str(failure.value)
+    assert provider_detail not in caplog.text
     assert len(calls) == 1
     assert calls[0]["url"].endswith(f"/{ZIPLIN_PHONE_ID}/messages")
 
@@ -485,6 +490,55 @@ def install_image_http_client(monkeypatch):
 
     monkeypatch.setattr(whatsapp_module.httpx, "AsyncClient", RecordingImageAsyncClient)
     return calls
+
+
+def test_media_download_failure_never_logs_provider_ids_or_signed_urls(
+    ziplin_client, monkeypatch, caplog
+):
+    raw_media_id = "secret-meta-media-id"
+    signed_media_url = "https://media.example.test/download?signature=secret-query-value"
+
+    class MetadataResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "url": signed_media_url,
+                "mime_type": "image/png",
+                "file_size": 64,
+            }
+
+    class RedactionProbeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def get(self, url, *, headers):
+            if raw_media_id in url:
+                return MetadataResponse()
+            request = whatsapp_module.httpx.Request("GET", url)
+            response = whatsapp_module.httpx.Response(403, request=request)
+            raise whatsapp_module.httpx.HTTPStatusError(
+                f"403 for signed URL {url}", request=request, response=response
+            )
+
+    monkeypatch.setattr(whatsapp_module.httpx, "AsyncClient", RedactionProbeClient)
+
+    with pytest.raises(WhatsAppMediaDownloadError) as failure:
+        asyncio.run(WhatsAppClient().download_media(raw_media_id))
+
+    combined = f"{failure.value}\n{caplog.text}"
+    assert raw_media_id not in combined
+    assert signed_media_url not in combined
+    assert "secret-query-value" not in combined
 
 
 def test_ziplin_relay_runs_queue_worker_bot_and_outbound_http(

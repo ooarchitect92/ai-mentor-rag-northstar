@@ -1,5 +1,5 @@
 @echo off
-setlocal enabledelayedexpansion
+setlocal DisableDelayedExpansion
 title AI Mentor - NorthStar Persistent Launcher
 
 pushd "%~dp0"
@@ -40,24 +40,36 @@ if /i "%~1"=="--no-build" set "BUILD_ARG="
 
 rem Read APP_PORT from .env so the printed URL matches the real port.
 set "APP_PORT=8000"
+set "APP_ENVIRONMENT=development"
 set "ADMIN_TOKEN="
 set "WHATSAPP_APP_SECRET="
 set "META_APP_SECRET="
+set "META_APP_ID="
+set "FACEBOOK_APP_ID="
 set "WHATSAPP_VERIFY_TOKEN="
+set "WHATSAPP_ACCESS_TOKEN="
+set "WHATSAPP_TOKEN="
+set "WHATSAPP_PHONE_NUMBER_ID="
+set "WHATSAPP_BUSINESS_ACCOUNT_ID="
 set "WHATSAPP_USE_MOCK=false"
 set "WHATSAPP_WEBHOOK_CALLBACK_URL="
-set "WHATSAPP_RELAY_TOKEN="
 set "CLOUDFLARE_TUNNEL_TOKEN="
 set "NORTHSTAR_PUBLIC_BASE_URL="
 for /f "usebackq eol=# tokens=1,* delims==" %%a in (".env") do (
     if /i "%%a"=="APP_PORT" set "APP_PORT=%%b"
+    if /i "%%a"=="APP_ENVIRONMENT" set "APP_ENVIRONMENT=%%b"
     if /i "%%a"=="ADMIN_TOKEN" set "ADMIN_TOKEN=%%b"
     if /i "%%a"=="WHATSAPP_APP_SECRET" set "WHATSAPP_APP_SECRET=%%b"
     if /i "%%a"=="META_APP_SECRET" set "META_APP_SECRET=%%b"
+    if /i "%%a"=="META_APP_ID" set "META_APP_ID=%%b"
+    if /i "%%a"=="FACEBOOK_APP_ID" set "FACEBOOK_APP_ID=%%b"
     if /i "%%a"=="WHATSAPP_VERIFY_TOKEN" set "WHATSAPP_VERIFY_TOKEN=%%b"
+    if /i "%%a"=="WHATSAPP_ACCESS_TOKEN" set "WHATSAPP_ACCESS_TOKEN=%%b"
+    if /i "%%a"=="WHATSAPP_TOKEN" set "WHATSAPP_TOKEN=%%b"
+    if /i "%%a"=="WHATSAPP_PHONE_NUMBER_ID" set "WHATSAPP_PHONE_NUMBER_ID=%%b"
+    if /i "%%a"=="WHATSAPP_BUSINESS_ACCOUNT_ID" set "WHATSAPP_BUSINESS_ACCOUNT_ID=%%b"
     if /i "%%a"=="WHATSAPP_USE_MOCK" set "WHATSAPP_USE_MOCK=%%b"
     if /i "%%a"=="WHATSAPP_WEBHOOK_CALLBACK_URL" set "WHATSAPP_WEBHOOK_CALLBACK_URL=%%b"
-    if /i "%%a"=="WHATSAPP_RELAY_TOKEN" set "WHATSAPP_RELAY_TOKEN=%%b"
     if /i "%%a"=="CLOUDFLARE_TUNNEL_TOKEN" set "CLOUDFLARE_TUNNEL_TOKEN=%%b"
     if /i "%%a"=="NORTHSTAR_PUBLIC_BASE_URL" set "NORTHSTAR_PUBLIC_BASE_URL=%%b"
 )
@@ -70,8 +82,24 @@ if /i "%ADMIN_TOKEN%"=="change-me" (
     echo [ERROR] ADMIN_TOKEN still uses the insecure example value. Replace it in .env.
     goto :fail
 )
-if /i not "%WHATSAPP_USE_MOCK%"=="true" if "%WHATSAPP_RELAY_TOKEN%"=="" if "%WHATSAPP_APP_SECRET%%META_APP_SECRET%"=="" (
-    echo [ERROR] WHATSAPP_APP_SECRET or META_APP_SECRET is required when no authenticated relay is configured.
+if /i not "%WHATSAPP_USE_MOCK%"=="true" if "%WHATSAPP_APP_SECRET%%META_APP_SECRET%"=="" (
+    echo [ERROR] WHATSAPP_APP_SECRET or META_APP_SECRET is required for direct Meta delivery.
+    goto :fail
+)
+if /i not "%WHATSAPP_USE_MOCK%"=="true" if "%META_APP_ID%%FACEBOOK_APP_ID%"=="" (
+    echo [ERROR] META_APP_ID is required for direct Ziplin registration.
+    goto :fail
+)
+if /i not "%WHATSAPP_USE_MOCK%"=="true" if "%WHATSAPP_ACCESS_TOKEN%%WHATSAPP_TOKEN%"=="" (
+    echo [ERROR] WHATSAPP_ACCESS_TOKEN is required for direct Meta messaging.
+    goto :fail
+)
+if /i not "%WHATSAPP_USE_MOCK%"=="true" if "%WHATSAPP_PHONE_NUMBER_ID%"=="" (
+    echo [ERROR] WHATSAPP_PHONE_NUMBER_ID is required for Ziplin routing.
+    goto :fail
+)
+if /i not "%WHATSAPP_USE_MOCK%"=="true" if "%WHATSAPP_BUSINESS_ACCOUNT_ID%"=="" (
+    echo [ERROR] WHATSAPP_BUSINESS_ACCOUNT_ID is required for WABA isolation.
     goto :fail
 )
 if /i not "%WHATSAPP_USE_MOCK%"=="true" if "%WHATSAPP_VERIFY_TOKEN%"=="" (
@@ -80,6 +108,11 @@ if /i not "%WHATSAPP_USE_MOCK%"=="true" if "%WHATSAPP_VERIFY_TOKEN%"=="" (
 )
 if /i "%WHATSAPP_VERIFY_TOKEN%"=="change-me-whatsapp" (
     echo [ERROR] WHATSAPP_VERIFY_TOKEN still uses the insecure example value.
+    goto :fail
+)
+if /i "%APP_ENVIRONMENT%"=="production" if /i not "%WHATSAPP_USE_MOCK%"=="true" if "%WHATSAPP_WEBHOOK_CALLBACK_URL%"=="" (
+    echo [ERROR] Production requires WHATSAPP_WEBHOOK_CALLBACK_URL.
+    echo         Use https://YOUR-STABLE-HOST/v1/whatsapp/ziplin/webhook
     goto :fail
 )
 
@@ -97,14 +130,12 @@ if not "%CLOUDFLARE_TUNNEL_TOKEN%"=="" (
     echo Starting the persistent named Cloudflare tunnel.
 ) else (
     docker compose stop named-tunnel >nul 2>&1
-    if not "%WHATSAPP_WEBHOOK_CALLBACK_URL%"=="" if not "%NORTHSTAR_PUBLIC_BASE_URL%"=="" (
-        echo Preserving external WhatsApp callback and using the configured stable relay origin.
-    ) else if not "%WHATSAPP_WEBHOOK_CALLBACK_URL%"=="" if "%WHATSAPP_RELAY_TOKEN%"=="" (
-        echo Preserving external WhatsApp callback; no NorthStar relay is configured.
+    if not "%WHATSAPP_WEBHOOK_CALLBACK_URL%"=="" (
+        docker compose stop public-tunnel >nul 2>&1
+        echo Using the configured direct Ziplin Meta callback.
     ) else (
         set "COMPOSE_PROFILE_ARGS=--profile tunnel"
-        echo [WARN] No CLOUDFLARE_TUNNEL_TOKEN is configured.
-        echo        Starting a quick test tunnel; its hostname is not permanent.
+        echo [WARN] Starting a quick direct test tunnel; its hostname is not permanent.
     )
 )
 docker compose %COMPOSE_PROFILE_ARGS% up -d %BUILD_ARG%
@@ -131,8 +162,11 @@ if errorlevel 1 (
 echo.
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\windows\register_webhook.ps1"
 if errorlevel 1 (
-    echo [WARN] WhatsApp startup validation failed. Review the [FAIL] message above.
-    echo        The chat UI still works, but WhatsApp delivery or replies may not.
+    if /i "%APP_ENVIRONMENT%"=="production" (
+        echo [ERROR] Direct Ziplin registration failed; production startup is not healthy.
+        goto :fail
+    )
+    echo [WARN] WhatsApp development validation failed. Review the [FAIL] message above.
 )
 
 echo.

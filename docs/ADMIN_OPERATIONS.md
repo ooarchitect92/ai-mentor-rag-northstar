@@ -43,6 +43,16 @@ category, review status, and internal notes. Attachments require admin auth and
 use no-store/sandbox response headers. Retention and storage quotas are
 environment-controlled.
 
+## Conversations
+
+Shows a view-only timeline of inbound and outbound messages for the configured
+Ziplin Phone Number ID. Conversation URLs use internal opaque IDs; list and
+thread responses expose only masked phone numbers and sanitized message fields.
+Raw webhook payloads, full phone numbers, Meta message/media IDs, filesystem
+paths, tokens, and attachments are not available through this view. The active
+page refreshes every ten seconds only while the browser tab is visible, and
+both the list and thread also provide manual refresh controls.
+
 ## Enrollments
 
 Look up a full international number. Save grants a course; the X on a course chip
@@ -56,79 +66,81 @@ The bulk importer accepts `.xlsx` workbooks with `phone_number`, `course`, and
 `active` columns plus optional `student_name` and `notes`. Google Sheets must be
 shared with the configured service-account email as Editor.
 
-## Existing WhatsApp webhook relay
+## Direct Ziplin Meta webhook
 
-Keep the callback already registered in Meta. The existing webhook application
-must forward each unmodified WhatsApp JSON payload to NorthStar:
-
-```dotenv
-WHATSAPP_WEBHOOK_CALLBACK_URL=https://your-existing-service.example/webhooks/whatsapp
-```
-
-When this setting is present, `start.bat` verifies both the callback challenge
-and Meta's active subscription without changing either. The temporary public
-tunnel is disabled.
+The production message path is direct and dedicated:
 
 ```text
-POST {NORTHSTAR_BASE_URL}/v1/whatsapp/ziplin/relay
-Content-Type: application/json
-X-Ziplin-Relay-Token: {WHATSAPP_RELAY_TOKEN}
+Meta WhatsApp Cloud API
+  -> POST https://mentor.example.com/v1/whatsapp/ziplin/webhook
+  -> durable NorthStar webhook queue
+  -> mentor worker
+  -> Meta WhatsApp Cloud API reply
 ```
 
-Generate a secret once and put the identical value in both deployments. It must
-contain at least 32 random characters:
+Use a permanent HTTPS hostname backed by a named Cloudflare Tunnel or managed
+ingress. A `trycloudflare.com` quick-tunnel hostname changes after restart and
+is suitable only for temporary development checks.
 
-```powershell
-[Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLower()
-```
-
-NorthStar `.env`:
+Configure these values in the deployment secret environment, never in browser
+JavaScript or committed files:
 
 ```dotenv
-WHATSAPP_RELAY_TOKEN=generated-secret
+WHATSAPP_ACCESS_TOKEN=<system-user-token>
+WHATSAPP_PHONE_NUMBER_ID=<ziplin-phone-number-id>
+WHATSAPP_BUSINESS_ACCOUNT_ID=<ziplin-waba-id>
+META_APP_ID=<ziplin-meta-app-id>
+WHATSAPP_APP_SECRET=<ziplin-meta-app-secret>
+WHATSAPP_VERIFY_TOKEN=<long-random-verification-secret>
 NORTHSTAR_PUBLIC_BASE_URL=https://mentor.example.com
+WHATSAPP_WEBHOOK_CALLBACK_URL=https://mentor.example.com/v1/whatsapp/ziplin/webhook
+CLOUDFLARE_TUNNEL_TOKEN=<named-tunnel-token-if-used>
 ```
 
-`NORTHSTAR_PUBLIC_BASE_URL` must be a permanent HTTPS origin. Do not save a
-`trycloudflare.com` quick-tunnel hostname in Xolox: that hostname changes when
-the tunnel restarts and silently disconnects inbound messages.
+The production callback URL must use the exact
+`/v1/whatsapp/ziplin/webhook` path. The generic endpoint remains a served
+compatibility alias but is rejected by production readiness and registration
+checks. The app secret authenticates POST deliveries with
+`X-Hub-Signature-256`; the independently generated verify token is used only
+for Meta's GET challenge. The system-user token must have
+`whatsapp_business_messaging` and `whatsapp_business_management` for the same
+WABA and Phone Number ID.
 
-Python forwarding example (use the raw parsed payload received from Meta):
+In the Ziplin Meta app, subscribe the `whatsapp_business_account` object to the
+`messages` field, register the callback URL and verification token, and ensure
+the app is subscribed to the configured WABA. NorthStar rejects an entire batch
+before persistence if any message or status receipt lacks the configured WABA
+or Phone Number ID, and checks the number again during message processing.
 
-```python
-import httpx
+`start.bat` runs `scripts/windows/register_webhook.ps1`. That registration
+script first requires the public `/ready` endpoint and callback challenge to
+succeed, then updates and verifies the Meta app subscription. Running it is an
+external Meta configuration change. Use the diagnostic command below when a
+read-only audit is required.
 
-async with httpx.AsyncClient(timeout=10) as client:
-    response = await client.post(
-        f"{NORTHSTAR_BASE_URL}/v1/whatsapp/ziplin/relay",
-        json=meta_payload,
-        headers={"X-Ziplin-Relay-Token": NORTHSTAR_RELAY_TOKEN},
-    )
-    response.raise_for_status()
+```powershell
+docker compose exec -T api python /app/scripts/whatsapp/whatsapp_diagnostics.py
 ```
 
-Node/Express forwarding example:
+The default diagnostic performs read-only checks of configuration presence,
+token permissions, Phone Number ID/WABA ownership, app subscription, approved
+template, registered callback, callback challenge, and public
+readiness. It does not send a WhatsApp message or change Meta configuration.
 
-```javascript
-const response = await fetch(`${process.env.NORTHSTAR_BASE_URL}/v1/whatsapp/ziplin/relay`, {
-  method: "POST",
-  headers: {
-    "content-type": "application/json",
-    "x-ziplin-relay-token": process.env.NORTHSTAR_RELAY_TOKEN,
-  },
-  body: JSON.stringify(req.body),
-});
-if (!response.ok) throw new Error(`NorthStar relay failed: ${response.status}`);
+An outbound template test is deliberately opt-in and requires an explicit
+approved recipient:
+
+```powershell
+docker compose exec -T api python /app/scripts/whatsapp/whatsapp_diagnostics.py --send-template --recipient <international-number>
 ```
 
-Return `200` to Meta only after the existing application has durably accepted
-its own work. A relay failure should be retried internally; do not silently drop
-it. Meta message IDs are deduplicated by this service. Forward only payloads for
-Ziplin; the service also enforces the configured Phone Number ID before queueing.
-
-The relay solves inbound routing only. NorthStar still needs a current Meta
-access token with `whatsapp_business_messaging` for the same Phone Number ID to
-send replies. Never place either secret in frontend JavaScript.
+The opt-in send uses NorthStar's WhatsApp client, so a Meta-accepted message is
+recorded in Conversations immediately; it does not yet prove handset delivery.
+Confirm the delivered/read status callback. For a genuine inbound
+test, send `Hi` from a test handset, confirm the event completes in the durable
+queue, appears once in Conversations, and receives exactly one reply. Never
+paste access tokens, app secrets, tunnel tokens, or verification tokens into
+chat, screenshots, issue trackers, or command output.
 
 ## Analytics
 

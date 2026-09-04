@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 import logging
 import time
 from datetime import UTC, datetime, timedelta
@@ -6,6 +7,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
 from urllib.parse import urlparse
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
@@ -154,22 +156,64 @@ async def _whatsapp_status_payload() -> dict[str, Any]:
     token_configured = bool((settings.whatsapp_access_token or settings.whatsapp_token).strip())
     phone_configured = bool(settings.whatsapp_phone_number_id.strip())
     signature_configured = bool((settings.whatsapp_app_secret or settings.meta_app_secret).strip())
-    relay_configured = bool(settings.whatsapp_relay_token.strip())
+    relay_configured = bool(
+        settings.app_environment.casefold() != "production"
+        and settings.whatsapp_relay_token.strip()
+    )
     callback_url = settings.whatsapp_webhook_callback_url.strip()
-    callback_path = urlparse(callback_url).path.rstrip("/").lower() if callback_url else ""
-    direct_callback = callback_path.endswith(("/v1/whatsapp/webhook", "/v1/whatsapp/ziplin/webhook")) or not callback_url
-    delivery_mode = "direct" if direct_callback else "existing_webhook_relay"
+    try:
+        callback_origin = urlparse(callback_url)
+        callback_hostname = (callback_origin.hostname or "").rstrip(".").casefold()
+    except ValueError:
+        callback_origin = urlparse("")
+        callback_hostname = ""
+    callback_path = callback_origin.path if callback_url else ""
+    direct_callback = bool(
+        callback_path == "/v1/whatsapp/ziplin/webhook"
+        and not callback_origin.params
+        and not callback_origin.query
+        and not callback_origin.fragment
+    )
+    if direct_callback:
+        delivery_mode = "direct_meta"
+    elif callback_url:
+        delivery_mode = "misconfigured_legacy_callback"
+    else:
+        delivery_mode = "direct_meta_unconfigured"
     public_base_url = settings.northstar_public_base_url.strip().rstrip("/")
     public_origin = urlparse(public_base_url)
-    stable_ingress_configured = bool(
+    stable_public_origin = bool(
         public_origin.scheme == "https"
         and public_origin.hostname
         and not public_origin.hostname.casefold().endswith(".trycloudflare.com")
     )
+    public_callback_host = bool(callback_hostname and "." in callback_hostname)
+    try:
+        ipaddress.ip_address(callback_hostname)
+        public_callback_host = False
+    except ValueError:
+        public_callback_host = (
+            public_callback_host
+            and callback_hostname != "localhost"
+            and not callback_hostname.endswith((".localhost", ".local"))
+        )
+    try:
+        supported_callback_port = callback_origin.port in {None, 443}
+    except ValueError:
+        supported_callback_port = False
+    stable_ingress_configured = bool(
+        direct_callback
+        and callback_origin.scheme.casefold() == "https"
+        and public_callback_host
+        and supported_callback_port
+        and not callback_origin.username
+        and not callback_origin.password
+        and not callback_hostname.endswith(".trycloudflare.com")
+    )
     routing_ready = bool(
-        settings.whatsapp_verify_token.strip() and signature_configured
-        if direct_callback
-        else relay_configured and stable_ingress_configured
+        stable_ingress_configured
+        and settings.whatsapp_verify_token.strip()
+        and signature_configured
     )
     return {
         "enabled": settings.whatsapp_messaging_enabled,
@@ -191,7 +235,9 @@ async def _whatsapp_status_payload() -> dict[str, Any]:
         "direct_callback_path": "/v1/whatsapp/ziplin/webhook",
         "relay_path": "/v1/whatsapp/ziplin/relay",
         "relay_destination_url": (
-            f"{public_base_url}/v1/whatsapp/ziplin/relay" if stable_ingress_configured else ""
+            f"{public_base_url}/v1/whatsapp/ziplin/relay"
+            if relay_configured and stable_public_origin
+            else ""
         ),
         "feedback_number": settings.whatsapp_feedback_number,
         "open_cma_access": settings.whatsapp_open_cma_access,
@@ -206,6 +252,52 @@ async def _whatsapp_status_payload() -> dict[str, Any]:
 @router.get("/whatsapp/status")
 async def whatsapp_status():
     return await _whatsapp_status_payload()
+
+
+def _whatsapp_phone_number_id() -> str:
+    phone_number_id = get_settings().whatsapp_phone_number_id.strip()
+    if not phone_number_id:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="WhatsApp Phone Number ID is not configured",
+        )
+    return phone_number_id
+
+
+@router.get("/whatsapp/conversations")
+async def list_whatsapp_conversations(
+    search: str = Query(default="", max_length=200),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+):
+    return await _store().list_whatsapp_conversations(
+        _whatsapp_phone_number_id(),
+        search=search.strip(),
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/whatsapp/conversations/{conversation_id}/messages")
+async def list_whatsapp_messages(
+    conversation_id: str,
+    limit: int = Query(default=100, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+):
+    try:
+        opaque_id = str(UUID(conversation_id))
+    except (ValueError, AttributeError) as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found") from exc
+
+    result = await _store().list_whatsapp_messages(
+        opaque_id,
+        _whatsapp_phone_number_id(),
+        limit=limit,
+        offset=offset,
+    )
+    if result is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
+    return result
 
 
 @router.put("/whatsapp/messaging")

@@ -73,9 +73,24 @@ try {
     if (response.exceptionDetails) throw new Error(response.exceptionDetails.text);
     return response.result.value;
   };
+  const waitForDashboardOrigin = async () => {
+    const expectedOrigin = new URL(dashboardUrl).origin;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      try {
+        const pageState = JSON.parse(await evaluate(`JSON.stringify({ origin: location.origin, readyState: document.readyState })`));
+        if (pageState.origin === expectedOrigin && pageState.readyState !== "loading") return;
+      } catch {
+        // Navigation can briefly replace the JavaScript execution context.
+      }
+      await delay(200);
+    }
+    throw new Error(`Dashboard did not reach ${expectedOrigin} before smoke setup.`);
+  };
 
   await send("Runtime.enable");
   await send("Page.enable");
+  await send("Page.navigate", { url: dashboardUrl });
+  await waitForDashboardOrigin();
   await evaluate(`sessionStorage.setItem("northstar.admin.token", ${JSON.stringify(adminToken)}); location.hash = "#overview"; location.reload()`);
   await delay(1800);
 
@@ -85,6 +100,7 @@ try {
     training: "Training",
     feedback: "Feedback",
     enrollments: "Enrollments",
+    conversations: "Conversations",
     analytics: "Analytics",
     activity: "Activity",
     configuration: "Configuration",
@@ -118,14 +134,22 @@ try {
       })`));
       const requiredText = route === "training"
         ? "WhatsApp answer preview"
-        : route === "enrollments" ? "WhatsApp messaging control" : "";
+        : route === "enrollments" ? "WhatsApp messaging control"
+          : route === "conversations" ? "WhatsApp inbox" : "";
       const passed = state.title === expectedTitle
         && state.content.length > 0
-        && (!requiredText || state.content.includes(requiredText))
+        && (!requiredText || state.content.toLocaleLowerCase().includes(requiredText.toLocaleLowerCase()))
         && !state.loading
         && !state.error
         && !state.overflow;
-      results.push({ viewport: viewport.label, route, passed, ...state, content: undefined });
+      results.push({
+        viewport: viewport.label,
+        route,
+        passed,
+        ...state,
+        contentPreview: passed ? undefined : state.content.slice(0, 500),
+        content: undefined,
+      });
     }
   }
 
@@ -134,7 +158,16 @@ try {
   if (failures.length || exceptions.length) process.exitCode = 1;
 } finally {
   socket?.close();
+  const exited = new Promise((resolve) => chrome.once("exit", resolve));
   chrome.kill("SIGTERM");
-  await delay(250);
-  await rm(profile, { recursive: true, force: true });
+  await Promise.race([exited, delay(2000)]);
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await rm(profile, { recursive: true, force: true });
+      break;
+    } catch (error) {
+      if (attempt === 4) throw error;
+      await delay(250);
+    }
+  }
 }

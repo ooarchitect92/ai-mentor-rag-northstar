@@ -4,6 +4,7 @@ Use this directory as the documentation entrypoint.
 
 | File or folder | Purpose |
 | --- | --- |
+| `ARCHITECTURE_AND_SAAS_HARDENING.md` | Current runtime architecture, Ziplin data flows, SaaS gaps, target design, and phased hardening plan |
 | `PROJECT_STRUCTURE.md` | Repository ownership, storage boundaries, and placement rules |
 | `ADMIN_OPERATIONS.md` | Admin pages, workflows, failure handling, and recovery |
 | `TESTING.md` | Test strategy and release verification |

@@ -80,6 +80,9 @@ async def recover_and_schedule_training() -> None:
     purged = await store.purge_expired_feedback()
     if purged:
         logger.info("Purged %s expired feedback record(s)", purged)
+    purged_messages = await store.purge_expired_whatsapp_messages()
+    if purged_messages:
+        logger.info("Purged %s expired WhatsApp conversation message(s)", purged_messages)
 
 
 async def training_supervisor() -> None:

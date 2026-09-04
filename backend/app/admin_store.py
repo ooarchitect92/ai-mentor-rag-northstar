@@ -17,6 +17,8 @@ from .question_history import normalize_question_text
 DOCUMENT_STATUSES = {"draft", "queued", "indexing", "indexed", "failed", "deleting"}
 FEEDBACK_STATUSES = {"open", "reviewing", "resolved", "dismissed"}
 FEEDBACK_CATEGORIES = {"change", "error", "other"}
+WHATSAPP_MESSAGE_STATUSES = {"received", "accepted", "sent", "delivered", "read", "failed"}
+WHATSAPP_SUCCESS_STATUS_RANK = {"accepted": 0, "sent": 1, "delivered": 2, "read": 3}
 
 
 class VersionConflictError(RuntimeError):
@@ -166,6 +168,41 @@ class AdminStore:
                 CREATE INDEX IF NOT EXISTS idx_webhook_events_due
                     ON whatsapp_webhook_events(status, available_at, updated_at);
 
+                CREATE TABLE IF NOT EXISTS whatsapp_conversations (
+                    id TEXT PRIMARY KEY,
+                    business_phone_number_id TEXT NOT NULL,
+                    contact_phone TEXT NOT NULL,
+                    profile_name TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(business_phone_number_id, contact_phone)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_whatsapp_conversations_updated
+                    ON whatsapp_conversations(business_phone_number_id, updated_at DESC, id DESC);
+
+                CREATE TABLE IF NOT EXISTS whatsapp_messages (
+                    id TEXT PRIMARY KEY,
+                    conversation_id TEXT NOT NULL,
+                    business_phone_number_id TEXT NOT NULL,
+                    meta_message_id TEXT NOT NULL,
+                    direction TEXT NOT NULL CHECK(direction IN ('inbound', 'outbound')),
+                    message_type TEXT NOT NULL,
+                    body TEXT NOT NULL DEFAULT '',
+                    has_media INTEGER NOT NULL DEFAULT 0 CHECK(has_media IN (0, 1)),
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    status_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(business_phone_number_id, meta_message_id),
+                    FOREIGN KEY(conversation_id) REFERENCES whatsapp_conversations(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_conversation
+                    ON whatsapp_messages(conversation_id, created_at DESC, id DESC);
+                CREATE INDEX IF NOT EXISTS idx_whatsapp_messages_business_created
+                    ON whatsapp_messages(business_phone_number_id, created_at DESC, id DESC);
+
                 CREATE TABLE IF NOT EXISTS admin_audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     action TEXT NOT NULL,
@@ -290,6 +327,35 @@ class AdminStore:
                 "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                 (9, self._now()),
             )
+            migration_10 = connection.execute(
+                "SELECT 1 FROM schema_migrations WHERE version = 10"
+            ).fetchone()
+            if migration_10 is None:
+                # Webhook payloads are retained for seven days. Normalize those
+                # already-authenticated events once so the new inbox does not
+                # start empty after an upgrade. Message/conversation uniqueness
+                # makes this safe to resume if initialization is interrupted.
+                rows = connection.execute(
+                    "SELECT payload, created_at FROM whatsapp_webhook_events "
+                    "ORDER BY created_at, id"
+                ).fetchall()
+                configured_phone_id = get_settings().whatsapp_phone_number_id.strip()
+                for row in rows:
+                    try:
+                        payload = json.loads(str(row["payload"]))
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(payload, dict):
+                        self._normalize_whatsapp_payload_sync(
+                            connection,
+                            payload,
+                            fallback_created_at=str(row["created_at"]),
+                            configured_phone_id=configured_phone_id,
+                        )
+                connection.execute(
+                    "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                    (10, self._now()),
+                )
 
     @staticmethod
     def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -1318,6 +1384,340 @@ class AdminStore:
         return await asyncio.to_thread(self._recover_training_jobs_sync)
 
     @staticmethod
+    def _safe_whatsapp_identifier(value: Any, maximum: int = 128) -> str:
+        text = str(value or "").strip()
+        return "".join(character for character in text if character.isprintable())[:maximum]
+
+    @staticmethod
+    def _safe_whatsapp_phone(value: Any) -> str:
+        return "".join(character for character in str(value or "") if character.isdigit())[:20]
+
+    @staticmethod
+    def _safe_whatsapp_text(value: Any, maximum: int = 6000) -> str:
+        if value is None:
+            return ""
+        text = str(value).replace("\x00", "")
+        text = "".join(
+            character
+            for character in text
+            if character in {"\n", "\t"} or ord(character) >= 32
+        )
+        return text.strip()[:maximum]
+
+    @classmethod
+    def _safe_whatsapp_message_type(cls, value: Any) -> str:
+        normalized = cls._safe_whatsapp_identifier(value, 40).casefold()
+        if not normalized or any(
+            not (character.isalnum() or character in {"_", "-"})
+            for character in normalized
+        ):
+            return "unknown"
+        return normalized
+
+    @classmethod
+    def _whatsapp_timestamp(cls, value: Any, fallback: str) -> str:
+        raw = cls._safe_whatsapp_identifier(value, 64)
+        if not raw:
+            return fallback
+        try:
+            seconds = float(raw)
+            return datetime.fromtimestamp(seconds, UTC).isoformat()
+        except (OverflowError, TypeError, ValueError):
+            pass
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return fallback
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC).isoformat()
+
+    @classmethod
+    def _whatsapp_inbound_body(cls, message: dict[str, Any], message_type: str) -> tuple[str, bool]:
+        content = message.get(message_type) or {}
+        if not isinstance(content, dict):
+            content = {}
+        media_types = {"audio", "document", "image", "sticker", "video"}
+        has_media = bool(content.get("id")) or message_type in media_types
+        if message_type == "text":
+            return cls._safe_whatsapp_text(content.get("body")), False
+        if message_type in {"document", "image", "video"}:
+            body = content.get("caption")
+            if not body and message_type == "document":
+                body = content.get("filename")
+            return cls._safe_whatsapp_text(body), has_media
+        if message_type == "interactive":
+            reply_type = cls._safe_whatsapp_identifier(content.get("type"), 40)
+            reply = content.get(reply_type) or {}
+            if not isinstance(reply, dict):
+                reply = {}
+            return cls._safe_whatsapp_text(reply.get("title") or reply.get("id")), False
+        if message_type == "button":
+            return cls._safe_whatsapp_text(content.get("text") or content.get("payload")), False
+        if message_type == "reaction":
+            return cls._safe_whatsapp_text(content.get("emoji"), 64), False
+        if message_type == "location":
+            return "Shared location", False
+        if message_type == "contacts":
+            return "Shared contact", False
+        return "", has_media
+
+    @classmethod
+    def _ensure_whatsapp_conversation_sync(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        business_phone_number_id: str,
+        contact_phone: str,
+        profile_name: str | None,
+        occurred_at: str,
+    ) -> str:
+        normalized_profile = cls._safe_whatsapp_text(profile_name, 200) or None
+        conversation_id = str(uuid4())
+        connection.execute(
+            """
+            INSERT INTO whatsapp_conversations(
+                id, business_phone_number_id, contact_phone, profile_name,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(business_phone_number_id, contact_phone) DO UPDATE SET
+                profile_name = COALESCE(excluded.profile_name, whatsapp_conversations.profile_name),
+                updated_at = CASE
+                    WHEN excluded.updated_at > whatsapp_conversations.updated_at THEN excluded.updated_at
+                    ELSE whatsapp_conversations.updated_at
+                END
+            """,
+            (
+                conversation_id,
+                business_phone_number_id,
+                contact_phone,
+                normalized_profile,
+                occurred_at,
+                occurred_at,
+            ),
+        )
+        row = connection.execute(
+            """
+            SELECT id FROM whatsapp_conversations
+            WHERE business_phone_number_id = ? AND contact_phone = ?
+            """,
+            (business_phone_number_id, contact_phone),
+        ).fetchone()
+        if row is None:  # pragma: no cover - protected by the unique insert above
+            raise RuntimeError("WhatsApp conversation could not be persisted")
+        return str(row["id"])
+
+    @classmethod
+    def _record_whatsapp_inbound_message_sync(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        business_phone_number_id: str,
+        meta_message_id: str,
+        contact_phone: str,
+        profile_name: str | None,
+        message_type: str,
+        body: str,
+        has_media: bool,
+        created_at: str,
+        persisted_at: str,
+    ) -> None:
+        conversation_id = cls._ensure_whatsapp_conversation_sync(
+            connection,
+            business_phone_number_id=business_phone_number_id,
+            contact_phone=contact_phone,
+            profile_name=profile_name,
+            occurred_at=created_at,
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO whatsapp_messages(
+                id, conversation_id, business_phone_number_id, meta_message_id,
+                direction, message_type, body, has_media, status,
+                created_at, status_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'inbound', ?, ?, ?, 'received', ?, ?, ?)
+            """,
+            (
+                str(uuid4()),
+                conversation_id,
+                business_phone_number_id,
+                meta_message_id,
+                message_type,
+                body,
+                1 if has_media else 0,
+                created_at,
+                created_at,
+                persisted_at,
+            ),
+        )
+
+    @staticmethod
+    def _should_apply_whatsapp_status(current: str, incoming: str) -> bool:
+        if incoming == current:
+            return True
+        if current in {"read", "failed"}:
+            return False
+        if incoming == "failed":
+            return current not in {"delivered", "read"}
+        if current == "received":
+            return False
+        return WHATSAPP_SUCCESS_STATUS_RANK.get(incoming, -1) > WHATSAPP_SUCCESS_STATUS_RANK.get(current, -1)
+
+    @classmethod
+    def _apply_whatsapp_status_sync(
+        cls,
+        connection: sqlite3.Connection,
+        *,
+        business_phone_number_id: str,
+        meta_message_id: str,
+        contact_phone: str,
+        status_value: str,
+        status_at: str,
+        persisted_at: str,
+    ) -> None:
+        status_value = cls._safe_whatsapp_identifier(status_value, 32).casefold()
+        if status_value not in WHATSAPP_MESSAGE_STATUSES - {"received"}:
+            return
+        existing = connection.execute(
+            """
+            SELECT id, direction, status, status_at
+            FROM whatsapp_messages
+            WHERE business_phone_number_id = ? AND meta_message_id = ?
+            """,
+            (business_phone_number_id, meta_message_id),
+        ).fetchone()
+        if existing is None:
+            conversation_id = cls._ensure_whatsapp_conversation_sync(
+                connection,
+                business_phone_number_id=business_phone_number_id,
+                contact_phone=contact_phone,
+                profile_name=None,
+                occurred_at=status_at,
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO whatsapp_messages(
+                    id, conversation_id, business_phone_number_id, meta_message_id,
+                    direction, message_type, body, has_media, status,
+                    created_at, status_at, updated_at
+                ) VALUES (?, ?, ?, ?, 'outbound', 'unknown', '', 0, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid4()),
+                    conversation_id,
+                    business_phone_number_id,
+                    meta_message_id,
+                    status_value,
+                    status_at,
+                    status_at,
+                    persisted_at,
+                ),
+            )
+            return
+        if str(existing["direction"]) != "outbound":
+            return
+        current_status = str(existing["status"])
+        current_status_at = str(existing["status_at"] or "")
+        if status_at < current_status_at and status_value == current_status:
+            return
+        if not cls._should_apply_whatsapp_status(current_status, status_value):
+            return
+        connection.execute(
+            """
+            UPDATE whatsapp_messages
+            SET status = ?, status_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (status_value, max(status_at, current_status_at), persisted_at, str(existing["id"])),
+        )
+
+    @classmethod
+    def _normalize_whatsapp_payload_sync(
+        cls,
+        connection: sqlite3.Connection,
+        payload: dict[str, Any],
+        *,
+        fallback_created_at: str,
+        configured_phone_id: str,
+    ) -> None:
+        persisted_at = cls._now()
+        for entry in payload.get("entry") or []:
+            if not isinstance(entry, dict):
+                continue
+            for change in entry.get("changes") or []:
+                if not isinstance(change, dict):
+                    continue
+                value = change.get("value") or {}
+                if not isinstance(value, dict):
+                    continue
+                metadata = value.get("metadata") or {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                payload_phone_id = cls._safe_whatsapp_identifier(metadata.get("phone_number_id"))
+                business_phone_number_id = cls._safe_whatsapp_identifier(configured_phone_id)
+                if not business_phone_number_id:
+                    continue
+                if payload_phone_id and payload_phone_id != business_phone_number_id:
+                    continue
+                contacts: dict[str, str | None] = {}
+                for contact in value.get("contacts") or []:
+                    if not isinstance(contact, dict):
+                        continue
+                    contact_phone = cls._safe_whatsapp_phone(contact.get("wa_id"))
+                    profile = contact.get("profile") or {}
+                    if contact_phone:
+                        contacts[contact_phone] = (
+                            cls._safe_whatsapp_text(profile.get("name"), 200)
+                            if isinstance(profile, dict)
+                            else None
+                        )
+                for message in value.get("messages") or []:
+                    if not isinstance(message, dict):
+                        continue
+                    meta_message_id = cls._safe_whatsapp_identifier(message.get("id"), 512)
+                    contact_phone = cls._safe_whatsapp_phone(message.get("from"))
+                    if not meta_message_id or not contact_phone:
+                        continue
+                    message_type = cls._safe_whatsapp_message_type(message.get("type"))
+                    body, has_media = cls._whatsapp_inbound_body(message, message_type)
+                    created_at = cls._whatsapp_timestamp(
+                        message.get("timestamp"),
+                        fallback_created_at,
+                    )
+                    cls._record_whatsapp_inbound_message_sync(
+                        connection,
+                        business_phone_number_id=business_phone_number_id,
+                        meta_message_id=meta_message_id,
+                        contact_phone=contact_phone,
+                        profile_name=contacts.get(contact_phone),
+                        message_type=message_type,
+                        body=body,
+                        has_media=has_media,
+                        created_at=created_at,
+                        persisted_at=persisted_at,
+                    )
+                for status_event in value.get("statuses") or []:
+                    if not isinstance(status_event, dict):
+                        continue
+                    meta_message_id = cls._safe_whatsapp_identifier(status_event.get("id"), 512)
+                    contact_phone = cls._safe_whatsapp_phone(status_event.get("recipient_id"))
+                    if not meta_message_id or not contact_phone:
+                        continue
+                    status_at = cls._whatsapp_timestamp(
+                        status_event.get("timestamp"),
+                        fallback_created_at,
+                    )
+                    cls._apply_whatsapp_status_sync(
+                        connection,
+                        business_phone_number_id=business_phone_number_id,
+                        meta_message_id=meta_message_id,
+                        contact_phone=contact_phone,
+                        status_value=str(status_event.get("status") or ""),
+                        status_at=status_at,
+                        persisted_at=persisted_at,
+                    )
+
+    @staticmethod
     def _whatsapp_inbound_message_count(payload: dict[str, Any]) -> int:
         count = 0
         for entry in payload.get("entry") or []:
@@ -1354,6 +1754,12 @@ class AdminStore:
                 """,
                 (event_id, payload_hash, serialized, inbound_message_count, now, now, now),
             )
+            self._normalize_whatsapp_payload_sync(
+                connection,
+                payload,
+                fallback_created_at=now,
+                configured_phone_id=get_settings().whatsapp_phone_number_id.strip(),
+            )
             row = connection.execute(
                 "SELECT * FROM whatsapp_webhook_events WHERE payload_hash = ?",
                 (payload_hash,),
@@ -1389,6 +1795,359 @@ class AdminStore:
 
     async def whatsapp_queue_summary(self) -> dict[str, Any]:
         return await asyncio.to_thread(self._whatsapp_queue_summary_sync)
+
+    def _record_whatsapp_outbound_message_sync(
+        self,
+        *,
+        business_phone_number_id: str,
+        meta_message_id: str,
+        contact_phone: str,
+        message_type: str,
+        body: str,
+        has_media: bool,
+        status: str,
+        created_at: str | None,
+    ) -> bool:
+        business_phone_number_id = self._safe_whatsapp_identifier(business_phone_number_id)
+        meta_message_id = self._safe_whatsapp_identifier(meta_message_id, 512)
+        contact_phone = self._safe_whatsapp_phone(contact_phone)
+        message_type = self._safe_whatsapp_message_type(message_type)
+        body = self._safe_whatsapp_text(body)
+        status = self._safe_whatsapp_identifier(status, 32).casefold()
+        if status not in WHATSAPP_MESSAGE_STATUSES - {"received"}:
+            status = "accepted"
+        if not business_phone_number_id or not meta_message_id or not contact_phone:
+            return False
+        persisted_at = self._now()
+        message_created_at = self._whatsapp_timestamp(created_at, persisted_at)
+        with self._connect() as connection:
+            conversation_id = self._ensure_whatsapp_conversation_sync(
+                connection,
+                business_phone_number_id=business_phone_number_id,
+                contact_phone=contact_phone,
+                profile_name=None,
+                occurred_at=message_created_at,
+            )
+            existing = connection.execute(
+                """
+                SELECT id, direction, message_type, body, has_media, status,
+                       created_at, status_at
+                FROM whatsapp_messages
+                WHERE business_phone_number_id = ? AND meta_message_id = ?
+                """,
+                (business_phone_number_id, meta_message_id),
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO whatsapp_messages(
+                        id, conversation_id, business_phone_number_id, meta_message_id,
+                        direction, message_type, body, has_media, status,
+                        created_at, status_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'outbound', ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(uuid4()),
+                        conversation_id,
+                        business_phone_number_id,
+                        meta_message_id,
+                        message_type,
+                        body,
+                        1 if has_media else 0,
+                        status,
+                        message_created_at,
+                        message_created_at,
+                        persisted_at,
+                    ),
+                )
+                return True
+            if str(existing["direction"]) != "outbound":
+                return False
+            current_status = str(existing["status"])
+            resolved_status = current_status
+            resolved_status_at = str(existing["status_at"] or message_created_at)
+            if self._should_apply_whatsapp_status(current_status, status):
+                resolved_status = status
+                resolved_status_at = max(resolved_status_at, message_created_at)
+            resolved_type = (
+                message_type
+                if message_type != "unknown" or str(existing["message_type"]) == "unknown"
+                else str(existing["message_type"])
+            )
+            resolved_body = body or str(existing["body"] or "")
+            connection.execute(
+                """
+                UPDATE whatsapp_messages
+                SET conversation_id = ?, message_type = ?, body = ?, has_media = ?,
+                    status = ?, created_at = ?, status_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    conversation_id,
+                    resolved_type,
+                    resolved_body,
+                    1 if has_media or bool(existing["has_media"]) else 0,
+                    resolved_status,
+                    min(str(existing["created_at"]), message_created_at),
+                    resolved_status_at,
+                    persisted_at,
+                    str(existing["id"]),
+                ),
+            )
+        return True
+
+    async def record_whatsapp_outbound_message(
+        self,
+        *,
+        business_phone_number_id: str,
+        meta_message_id: str,
+        contact_phone: str,
+        message_type: str,
+        body: str,
+        has_media: bool = False,
+        status: str = "accepted",
+        created_at: str | None = None,
+    ) -> bool:
+        return await asyncio.to_thread(
+            self._record_whatsapp_outbound_message_sync,
+            business_phone_number_id=business_phone_number_id,
+            meta_message_id=meta_message_id,
+            contact_phone=contact_phone,
+            message_type=message_type,
+            body=body,
+            has_media=has_media,
+            status=status,
+            created_at=created_at,
+        )
+
+    @staticmethod
+    def _masked_whatsapp_phone(contact_phone: str) -> str:
+        if len(contact_phone) <= 4:
+            return "*" * len(contact_phone)
+        return "*" * (len(contact_phone) - 4) + contact_phone[-4:]
+
+    @classmethod
+    def _public_whatsapp_message(cls, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        values = dict(row)
+        return {
+            "id": str(values["id"]),
+            "direction": str(values["direction"]),
+            "message_type": str(values["message_type"]),
+            "text": str(values.get("body") or ""),
+            "has_media": bool(values.get("has_media")),
+            "status": str(values["status"]),
+            "created_at": str(values["created_at"]),
+            "status_at": str(values["status_at"]) if values.get("status_at") else None,
+        }
+
+    @classmethod
+    def _public_whatsapp_conversation(cls, row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
+        values = dict(row)
+        contact_phone = str(values["contact_phone"])
+        profile_name = str(values.get("profile_name") or "").strip() or None
+        if profile_name and cls._safe_whatsapp_phone(profile_name) == contact_phone:
+            # Meta may provide the contact's number as its profile name. Do not
+            # accidentally undo phone masking through the display-name field.
+            profile_name = None
+        masked_phone = cls._masked_whatsapp_phone(contact_phone)
+        return {
+            "id": str(values["id"]),
+            "profile_name": profile_name,
+            "masked_phone": masked_phone,
+            "display_name": profile_name or masked_phone,
+        }
+
+    def _list_whatsapp_conversations_sync(
+        self,
+        business_phone_number_id: str,
+        search: str,
+        limit: int,
+        offset: int,
+    ) -> dict[str, Any]:
+        business_phone_number_id = self._safe_whatsapp_identifier(business_phone_number_id)
+        limit = max(1, min(100, int(limit)))
+        offset = max(0, int(offset))
+        search = self._safe_whatsapp_text(search, 200)
+        filters = ["c.business_phone_number_id = ?"]
+        parameters: list[Any] = [business_phone_number_id]
+        if search:
+            escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            digits = self._safe_whatsapp_phone(search)
+            if digits:
+                filters.append(
+                    "(LOWER(COALESCE(c.profile_name, '')) LIKE LOWER(?) ESCAPE '\\' "
+                    "OR c.contact_phone LIKE ? ESCAPE '\\')"
+                )
+                parameters.extend((f"%{escaped}%", f"%{digits}%"))
+            else:
+                filters.append("LOWER(COALESCE(c.profile_name, '')) LIKE LOWER(?) ESCAPE '\\'")
+                parameters.append(f"%{escaped}%")
+        where = " AND ".join(filters)
+        with self._connect() as connection:
+            total = int(
+                connection.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM whatsapp_conversations c
+                    WHERE {where}
+                      AND EXISTS (
+                          SELECT 1 FROM whatsapp_messages present
+                          WHERE present.conversation_id = c.id
+                      )
+                    """,
+                    parameters,
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                f"""
+                SELECT c.*,
+                       (
+                           SELECT COUNT(*) FROM whatsapp_messages counted
+                           WHERE counted.conversation_id = c.id
+                       ) AS message_count,
+                       latest.id AS latest_id,
+                       latest.direction AS latest_direction,
+                       latest.message_type AS latest_message_type,
+                       latest.body AS latest_body,
+                       latest.has_media AS latest_has_media,
+                       latest.status AS latest_status,
+                       latest.created_at AS latest_created_at,
+                       latest.status_at AS latest_status_at
+                FROM whatsapp_conversations c
+                JOIN whatsapp_messages latest ON latest.id = (
+                    SELECT candidate.id
+                    FROM whatsapp_messages candidate
+                    WHERE candidate.conversation_id = c.id
+                    ORDER BY candidate.created_at DESC, candidate.id DESC
+                    LIMIT 1
+                )
+                WHERE {where}
+                ORDER BY latest.created_at DESC, latest.id DESC
+                LIMIT ? OFFSET ?
+                """,
+                [*parameters, limit, offset],
+            ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            values = dict(row)
+            conversation = self._public_whatsapp_conversation(values)
+            conversation["message_count"] = int(values["message_count"])
+            conversation["last_message"] = self._public_whatsapp_message(
+                {
+                    "id": values["latest_id"],
+                    "direction": values["latest_direction"],
+                    "message_type": values["latest_message_type"],
+                    "body": values["latest_body"],
+                    "has_media": values["latest_has_media"],
+                    "status": values["latest_status"],
+                    "created_at": values["latest_created_at"],
+                    "status_at": values["latest_status_at"],
+                }
+            )
+            items.append(conversation)
+        return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+    async def list_whatsapp_conversations(
+        self,
+        business_phone_number_id: str,
+        search: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        return await asyncio.to_thread(
+            self._list_whatsapp_conversations_sync,
+            business_phone_number_id,
+            search,
+            limit,
+            offset,
+        )
+
+    def _list_whatsapp_messages_sync(
+        self,
+        conversation_id: str,
+        business_phone_number_id: str,
+        limit: int,
+        offset: int,
+    ) -> dict[str, Any] | None:
+        conversation_id = self._safe_whatsapp_identifier(conversation_id, 128)
+        business_phone_number_id = self._safe_whatsapp_identifier(business_phone_number_id)
+        limit = max(1, min(100, int(limit)))
+        offset = max(0, int(offset))
+        with self._connect() as connection:
+            conversation = connection.execute(
+                """
+                SELECT * FROM whatsapp_conversations
+                WHERE id = ? AND business_phone_number_id = ?
+                """,
+                (conversation_id, business_phone_number_id),
+            ).fetchone()
+            if conversation is None:
+                return None
+            total = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM whatsapp_messages WHERE conversation_id = ?",
+                    (conversation_id,),
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                """
+                SELECT id, direction, message_type, body, has_media, status,
+                       created_at, status_at
+                FROM whatsapp_messages
+                WHERE conversation_id = ? AND business_phone_number_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (conversation_id, business_phone_number_id, limit, offset),
+            ).fetchall()
+        return {
+            "conversation": self._public_whatsapp_conversation(conversation),
+            # Page zero selects the newest records; chronological output keeps
+            # message bubbles in natural reading order.
+            "items": [self._public_whatsapp_message(row) for row in reversed(rows)],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+    async def list_whatsapp_messages(
+        self,
+        conversation_id: str,
+        business_phone_number_id: str,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any] | None:
+        return await asyncio.to_thread(
+            self._list_whatsapp_messages_sync,
+            conversation_id,
+            business_phone_number_id,
+            limit,
+            offset,
+        )
+
+    def _purge_expired_whatsapp_messages_sync(self) -> int:
+        retention_days = max(1, int(get_settings().whatsapp_message_retention_days))
+        cutoff = (datetime.now(UTC) - timedelta(days=retention_days)).isoformat()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                "DELETE FROM whatsapp_messages WHERE created_at < ?",
+                (cutoff,),
+            )
+            purged = max(0, int(cursor.rowcount))
+            connection.execute(
+                """
+                DELETE FROM whatsapp_conversations
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM whatsapp_messages
+                    WHERE whatsapp_messages.conversation_id = whatsapp_conversations.id
+                )
+                """
+            )
+        return purged
+
+    async def purge_expired_whatsapp_messages(self) -> int:
+        return await asyncio.to_thread(self._purge_expired_whatsapp_messages_sync)
 
     def _claim_whatsapp_webhook_sync(self, event_id: str) -> dict[str, Any] | None:
         now_dt = datetime.now(UTC)

@@ -176,10 +176,10 @@ def test_bot_ignores_messages_addressed_to_another_business_number(monkeypatch):
                     {
                         "value": {
                             "metadata": {"phone_number_id": "921055841100882"},
-                            "contacts": [{"wa_id": "919535210826"}],
+                            "contacts": [{"wa_id": "919876543210"}],
                             "messages": [
                                 {
-                                    "from": "919535210826",
+                                    "from": "919876543210",
                                     "id": "wamid.wrong-business-number",
                                     "type": "text",
                                     "text": {"body": "Hi"},
@@ -892,7 +892,7 @@ def test_mode_menu_contains_only_allowed_modes():
 def test_google_sheet_is_authoritative_for_enrollment(monkeypatch):
     monkeypatch.setenv("WHATSAPP_ENROLLMENTS_GOOGLE_SHEET_ID", "sheet-id")
     monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service-account.json")
-    monkeypatch.setenv("WHATSAPP_ENROLLMENTS", "919535210826:CPA")
+    monkeypatch.setenv("WHATSAPP_ENROLLMENTS", "919876543210:CPA")
     get_settings.cache_clear()
     whatsapp_module._google_sheet_cache = None
     whatsapp_module._google_sheet_cache_key = ""
@@ -900,10 +900,10 @@ def test_google_sheet_is_authoritative_for_enrollment(monkeypatch):
     monkeypatch.setattr(
         whatsapp_module,
         "_fetch_google_sheet_enrollments",
-        lambda *_args: {"919535210826": {"CMA", "CFA"}},
+        lambda *_args: {"919876543210": {"CMA", "CFA"}},
     )
 
-    courses = asyncio.run(get_enrolled_courses(FakeWhatsAppCache(), "9535210826"))
+    courses = asyncio.run(get_enrolled_courses(FakeWhatsAppCache(), "9876543210"))
 
     assert courses == {"CMA", "CFA"}
     get_settings.cache_clear()
@@ -912,7 +912,7 @@ def test_google_sheet_is_authoritative_for_enrollment(monkeypatch):
 def test_missing_google_sheet_row_denies_fallback_access(monkeypatch):
     monkeypatch.setenv("WHATSAPP_ENROLLMENTS_GOOGLE_SHEET_ID", "sheet-id")
     monkeypatch.setenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service-account.json")
-    monkeypatch.setenv("WHATSAPP_ENROLLMENTS", "919535210826:CMA")
+    monkeypatch.setenv("WHATSAPP_ENROLLMENTS", "919876543210:CMA")
     get_settings.cache_clear()
     whatsapp_module._google_sheet_cache = None
     whatsapp_module._google_sheet_cache_key = ""
@@ -923,7 +923,7 @@ def test_missing_google_sheet_row_denies_fallback_access(monkeypatch):
         lambda *_args: {"919999999999": {"CMA"}},
     )
 
-    course = asyncio.run(get_enrolled_course(FakeWhatsAppCache(), "9535210826"))
+    course = asyncio.run(get_enrolled_course(FakeWhatsAppCache(), "9876543210"))
 
     assert course is None
     get_settings.cache_clear()
@@ -964,14 +964,14 @@ def test_google_sheet_bulk_updates_use_one_writable_append(monkeypatch, tmp_path
 def test_enrollment_rows_disable_invalid_or_inactive_students():
     rows = [
         ["phone_number", "course", "active", "student_name", "notes"],
-        ["9535210826", "CMA", "YES", "Student A", ""],
+        ["9000000001", "CMA", "YES", "Student A", ""],
         ["9916039894", "CPA", "NO", "Student B", ""],
         ["9876543210", "UNKNOWN", "YES", "Student C", ""],
     ]
 
     enrollments = whatsapp_module._parse_enrollment_rows(rows)
 
-    assert enrollments["919535210826"] == {"CMA"}
+    assert enrollments["919000000001"] == {"CMA"}
     assert enrollments["919916039894"] == set()
     assert enrollments["919876543210"] == set()
 
@@ -979,15 +979,15 @@ def test_enrollment_rows_disable_invalid_or_inactive_students():
 def test_enrollment_rows_accumulate_multiple_active_courses_and_last_row_wins():
     rows = [
         ["phone_number", "course", "active", "student_name", "notes"],
-        ["9535210826", "CMA", "YES", "Student A", ""],
-        ["9535210826", "CFA", "YES", "Student A", ""],
-        ["9535210826", "CS", "YES", "Student A", ""],
-        ["9535210826", "CMA", "NO", "Student A", "revoked"],
+        ["9876543210", "CMA", "YES", "Student A", ""],
+        ["9876543210", "CFA", "YES", "Student A", ""],
+        ["9876543210", "CS", "YES", "Student A", ""],
+        ["9876543210", "CMA", "NO", "Student A", "revoked"],
     ]
 
     enrollments = whatsapp_module._parse_enrollment_rows(rows)
 
-    assert enrollments["919535210826"] == {"CFA", "CS"}
+    assert enrollments["919876543210"] == {"CFA", "CS"}
 
 
 def test_dashboard_enrollment_changes_are_written_live_to_excel(tmp_path, monkeypatch):
@@ -1071,7 +1071,7 @@ def test_excel_writer_ignores_preformatted_blank_template_rows(tmp_path, monkeyp
     sheet = workbook.active
     sheet.title = "Enrollments"
     sheet.append(["phone_number", "course", "active", "student_name", "notes"])
-    sheet.append(["919535210826", "CMA", "YES", "Existing student", ""])
+    sheet.append(["919876543210", "CMA", "YES", "Existing student", ""])
     for row_number in range(3, 101):
         sheet.cell(row=row_number, column=1).number_format = "@"
     workbook.save(workbook_path)

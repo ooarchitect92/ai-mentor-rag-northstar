@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 import json
 import logging
 import secrets
@@ -55,6 +56,54 @@ from .whatsapp import (
 
 logger = logging.getLogger("uvicorn.error")
 
+_DIRECT_WHATSAPP_CALLBACK_PATHS = {
+    "/v1/whatsapp/ziplin/webhook",
+}
+_WHATSAPP_WEBHOOK_MAX_BODY_BYTES = 2 * 1024 * 1024
+
+
+def _direct_whatsapp_callback_state(callback_url: str) -> tuple[bool, bool]:
+    """Return (direct_path, stable_https_origin) for the configured Meta callback."""
+    if not callback_url:
+        return False, False
+    try:
+        parsed = urlparse(callback_url.strip())
+        hostname = (parsed.hostname or "").rstrip(".").casefold()
+    except ValueError:
+        return False, False
+    callback_path = parsed.path
+    is_direct = bool(
+        callback_path in _DIRECT_WHATSAPP_CALLBACK_PATHS
+        and not parsed.params
+        and not parsed.query
+        and not parsed.fragment
+    )
+    public_host = bool(hostname and "." in hostname)
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        public_host = public_host and hostname not in {"localhost"} and not hostname.endswith(
+            (".localhost", ".local")
+        )
+    else:
+        # A permanent DNS hostname is required even when a literal IP address
+        # is publicly routable; certificates, ownership and rotation are much
+        # safer to operate against a stable name.
+        public_host = False
+    try:
+        supported_port = parsed.port in {None, 443}
+    except ValueError:
+        supported_port = False
+    is_stable_https = bool(
+        parsed.scheme.casefold() == "https"
+        and public_host
+        and supported_port
+        and not parsed.username
+        and not parsed.password
+        and not hostname.endswith(".trycloudflare.com")
+    )
+    return is_direct, is_stable_https
+
 
 def validate_startup_configuration() -> None:
     settings = get_settings()
@@ -67,15 +116,25 @@ def validate_startup_configuration() -> None:
     verify_token = settings.whatsapp_verify_token.strip()
     if not verify_token or verify_token == "change-me-whatsapp":
         errors.append("WHATSAPP_VERIFY_TOKEN is required and must not use the example value")
-    if (
-        not settings.whatsapp_relay_token.strip()
-        and not (settings.whatsapp_app_secret.strip() or settings.meta_app_secret.strip())
-    ):
-        errors.append("WHATSAPP_APP_SECRET is required when the authenticated relay is disabled")
+    app_secret = settings.whatsapp_app_secret.strip() or settings.meta_app_secret.strip()
+    if not app_secret:
+        errors.append("WHATSAPP_APP_SECRET is required for direct Meta webhook signature verification")
+    callback_url = settings.whatsapp_webhook_callback_url.strip()
+    direct_callback, stable_callback = _direct_whatsapp_callback_state(callback_url)
+    if not callback_url:
+        errors.append("WHATSAPP_WEBHOOK_CALLBACK_URL is required in production")
+    elif not direct_callback:
+        errors.append(
+            "WHATSAPP_WEBHOOK_CALLBACK_URL must point directly to /v1/whatsapp/ziplin/webhook"
+        )
+    elif not stable_callback:
+        errors.append("WHATSAPP_WEBHOOK_CALLBACK_URL must use a permanent HTTPS hostname")
     if not (settings.whatsapp_access_token.strip() or settings.whatsapp_token.strip()):
         errors.append("WHATSAPP_ACCESS_TOKEN is required")
     if not settings.whatsapp_phone_number_id.strip():
         errors.append("WHATSAPP_PHONE_NUMBER_ID is required")
+    if not settings.whatsapp_business_account_id.strip():
+        errors.append("WHATSAPP_BUSINESS_ACCOUNT_ID is required for webhook WABA isolation")
     feedback_digits = "".join(character for character in settings.whatsapp_feedback_number if character.isdigit())
     if not 8 <= len(feedback_digits) <= 15:
         errors.append("WHATSAPP_FEEDBACK_NUMBER must contain 8 to 15 E.164 digits")
@@ -124,9 +183,6 @@ def validate_startup_configuration() -> None:
         errors.append("WHATSAPP_WEBHOOK_MAX_ATTEMPTS must be between 1 and 20")
     if not 30 <= settings.whatsapp_inbound_processing_ttl_seconds <= 3600:
         errors.append("WHATSAPP_INBOUND_PROCESSING_TTL_SECONDS must be between 30 and 3600")
-    relay_token = settings.whatsapp_relay_token.strip()
-    if relay_token and len(relay_token) < 32:
-        errors.append("WHATSAPP_RELAY_TOKEN must be at least 32 characters when configured")
     if errors:
         raise RuntimeError("Unsafe production configuration: " + "; ".join(errors))
 
@@ -291,21 +347,12 @@ async def public_config():
     digits = "".join(character for character in settings.whatsapp_feedback_number if character.isdigit())
     feedback_url = ""
     callback_url = settings.whatsapp_webhook_callback_url.strip()
-    callback_path = urlparse(callback_url).path.rstrip("/").lower() if callback_url else ""
-    direct_callback = callback_path.endswith(
-        ("/v1/whatsapp/webhook", "/v1/whatsapp/ziplin/webhook")
-    ) or not callback_url
-    public_base_url = settings.northstar_public_base_url.strip().rstrip("/")
-    public_origin = urlparse(public_base_url)
-    stable_public_origin = bool(
-        public_origin.scheme == "https"
-        and public_origin.hostname
-        and not public_origin.hostname.casefold().endswith(".trycloudflare.com")
-    )
+    direct_callback, stable_callback = _direct_whatsapp_callback_state(callback_url)
     inbound_delivery_ready = bool(
-        (settings.whatsapp_app_secret or settings.meta_app_secret)
-        if direct_callback
-        else settings.whatsapp_relay_token and stable_public_origin
+        direct_callback
+        and stable_callback
+        and (settings.whatsapp_app_secret or settings.meta_app_secret)
+        and settings.whatsapp_verify_token
     )
     feedback_delivery_ready = bool(
         settings.whatsapp_messaging_enabled
@@ -337,7 +384,14 @@ async def verify_whatsapp_webhook(
     hub_challenge: str | None = Query(default=None, alias="hub.challenge"),
 ):
     settings = get_settings()
-    if hub_mode == "subscribe" and hub_verify_token == settings.whatsapp_verify_token:
+    configured_token = settings.whatsapp_verify_token
+    supplied_token = hub_verify_token or ""
+    if (
+        hub_mode == "subscribe"
+        and configured_token.strip()
+        and supplied_token.strip()
+        and secrets.compare_digest(supplied_token, configured_token)
+    ):
         return Response(content=hub_challenge or "", media_type="text/plain")
 
     raise HTTPException(
@@ -349,7 +403,7 @@ async def verify_whatsapp_webhook(
 @app.post("/v1/whatsapp/ziplin/webhook")
 @app.post("/v1/whatsapp/webhook")
 async def whatsapp_webhook(request: Request):
-    raw_body = await request.body()
+    raw_body = await _read_bounded_whatsapp_body(request)
     if not verify_meta_signature(raw_body, request.headers.get("x-hub-signature-256")):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -359,65 +413,190 @@ async def whatsapp_webhook(request: Request):
     return await _enqueue_whatsapp_webhook(raw_body)
 
 
-def _incoming_phone_ids(payload: dict) -> set[str]:
-    """Return target Phone Number IDs for inbound message changes.
+async def _read_bounded_whatsapp_body(request: Request) -> bytes:
+    """Read a webhook body while keeping application memory strictly bounded."""
+    declared_length = request.headers.get("content-length")
+    if declared_length:
+        try:
+            parsed_length = int(declared_length)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid Content-Length header",
+            ) from exc
+        if parsed_length < 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid Content-Length header",
+            )
+        if parsed_length > _WHATSAPP_WEBHOOK_MAX_BODY_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="Webhook payload is too large",
+            )
 
-    Delivery/status-only callbacks may not contain message metadata, so an
-    empty result is not treated as a routing failure. Actual inbound messages
-    must identify the Cloud API number they were sent to.
-    """
-    phone_ids: set[str] = set()
-    for entry in payload.get("entry") or []:
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(chunk) > _WHATSAPP_WEBHOOK_MAX_BODY_BYTES - len(body):
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="Webhook payload is too large",
+            )
+        body.extend(chunk)
+    return bytes(body)
+
+
+def _whatsapp_routing_rejection(payload: dict, *, phone_number_id: str, waba_id: str) -> str | None:
+    """Return a safe rejection reason unless every batched event belongs here."""
+    if payload.get("object") != "whatsapp_business_account":
+        return "invalid_webhook_routing"
+    entries = payload.get("entry")
+    if not isinstance(entries, list) or not entries:
+        return "invalid_webhook_routing"
+
+    expected_phone_id = phone_number_id.strip()
+    expected_waba_id = waba_id.strip()
+    if not expected_phone_id:
+        return "different_phone_number"
+
+    saw_event = False
+    for entry in entries:
         if not isinstance(entry, dict):
+            return "invalid_webhook_routing"
+        if expected_waba_id:
+            entry_id = entry.get("id")
+            if not isinstance(entry_id, str) or entry_id.strip() != expected_waba_id:
+                return "different_business_account"
+        changes = entry.get("changes")
+        if not isinstance(changes, list) or not changes:
+            return "invalid_webhook_routing"
+        for change in changes:
+            if not isinstance(change, dict) or change.get("field") != "messages":
+                return "invalid_webhook_routing"
+            value = change.get("value")
+            if not isinstance(value, dict):
+                return "invalid_webhook_routing"
+            messages = value.get("messages")
+            statuses = value.get("statuses")
+            if messages is not None and not isinstance(messages, list):
+                return "invalid_webhook_routing"
+            if statuses is not None and not isinstance(statuses, list):
+                return "invalid_webhook_routing"
+            events = [
+                item
+                for collection in (messages or [], statuses or [])
+                for item in collection
+            ]
+            if not events or any(not isinstance(item, dict) for item in events):
+                return "invalid_webhook_routing"
+            saw_event = True
+            metadata = value.get("metadata")
+            if not isinstance(metadata, dict):
+                return "different_phone_number"
+            routed_phone_id = metadata.get("phone_number_id")
+            if (
+                not isinstance(routed_phone_id, str)
+                or routed_phone_id.strip() != expected_phone_id
+            ):
+                return "different_phone_number"
+    return None if saw_event else "invalid_webhook_routing"
+
+
+def _status_only_whatsapp_payload(payload: dict) -> dict:
+    """Return a minimal copy containing delivery/status receipts only.
+
+    The dashboard kill switch pauses new student-message processing and all
+    outbound sends. Meta status callbacks are safe to retain while paused and
+    are needed to keep the read-only conversation timeline accurate. Removing
+    messages and contacts before persistence also guarantees a mixed callback
+    cannot be processed later after messaging is resumed.
+    """
+    filtered_entries: list[dict] = []
+    for raw_entry in payload.get("entry") or []:
+        if not isinstance(raw_entry, dict):
             continue
-        for change in entry.get("changes") or []:
-            if not isinstance(change, dict):
+        filtered_changes: list[dict] = []
+        for raw_change in raw_entry.get("changes") or []:
+            if not isinstance(raw_change, dict):
                 continue
-            value = change.get("value") or {}
-            if not isinstance(value, dict) or not value.get("messages"):
+            value = raw_change.get("value") or {}
+            if not isinstance(value, dict):
                 continue
-            metadata = value.get("metadata") or {}
-            phone_id = str(metadata.get("phone_number_id") or "").strip()
-            phone_ids.add(phone_id or "missing")
-    return phone_ids
+            statuses = [item for item in value.get("statuses") or [] if isinstance(item, dict)]
+            if not statuses:
+                continue
+            filtered_value: dict = {"statuses": statuses}
+            metadata = value.get("metadata")
+            if isinstance(metadata, dict):
+                filtered_value["metadata"] = metadata
+            filtered_change = {
+                key: item for key, item in raw_change.items() if key != "value"
+            }
+            filtered_change["value"] = filtered_value
+            filtered_changes.append(filtered_change)
+        if filtered_changes:
+            filtered_entry = {
+                key: item for key, item in raw_entry.items() if key != "changes"
+            }
+            filtered_entry["changes"] = filtered_changes
+            filtered_entries.append(filtered_entry)
+
+    result = {key: item for key, item in payload.items() if key != "entry"}
+    result["entry"] = filtered_entries
+    return result
 
 
 async def _enqueue_whatsapp_webhook(raw_body: bytes):
-    if not get_settings().whatsapp_messaging_enabled:
-        # Keep Meta verification healthy while intentionally declining to queue
-        # new student messages. HTTP 200 prevents unwanted delivery retries.
-        return {"status": "paused", "event_id": None}
-    if len(raw_body) > 2 * 1024 * 1024:
+    if len(raw_body) > _WHATSAPP_WEBHOOK_MAX_BODY_BYTES:
         raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Webhook payload is too large")
     try:
         payload = json.loads(raw_body)
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON payload") from exc
     if not isinstance(payload, dict):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Webhook payload must be a JSON object")
-    incoming_phone_ids = _incoming_phone_ids(payload)
-    configured_phone_id = get_settings().whatsapp_phone_number_id.strip()
-    if incoming_phone_ids and incoming_phone_ids != {configured_phone_id}:
+    settings = get_settings()
+    routing_rejection = _whatsapp_routing_rejection(
+        payload,
+        phone_number_id=settings.whatsapp_phone_number_id,
+        waba_id=settings.whatsapp_business_account_id,
+    )
+    if routing_rejection:
         logger.warning(
-            "WhatsApp webhook ignored before queueing target_phone_ids=%s configured_phone_id=%s",
-            sorted(incoming_phone_ids),
-            configured_phone_id or "missing",
+            "WhatsApp webhook ignored before queueing reason=%s",
+            routing_rejection,
         )
         return {
             "status": "ignored",
             "event_id": None,
-            "reason": "different_phone_number",
+            "reason": routing_rejection,
         }
+    if not settings.whatsapp_messaging_enabled:
+        # Keep Meta verification healthy while intentionally declining new
+        # student messages. Delivery/read receipts remain durable so the admin
+        # inbox does not become stale while replies are paused.
+        payload = _status_only_whatsapp_payload(payload)
+        if not payload["entry"]:
+            return {"status": "paused", "event_id": None}
     event = await AdminStore().enqueue_whatsapp_webhook(payload)
     if event["status"] not in {"completed", "dead_letter"}:
         schedule_whatsapp_webhook(str(event["id"]))
-    return {"status": "accepted", "event_id": event["id"]}
+    return {
+        "status": "accepted" if settings.whatsapp_messaging_enabled else "paused",
+        "event_id": event["id"],
+    }
 
 
 @app.post("/v1/whatsapp/relay")
 async def whatsapp_webhook_relay(request: Request):
-    """Accept a payload forwarded by the application's existing webhook owner."""
-    configured = get_settings().whatsapp_relay_token.strip()
+    """Legacy non-production compatibility path; Ziplin uses direct Meta delivery."""
+    settings = get_settings()
+    if settings.app_environment.casefold() == "production":
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Legacy WhatsApp relays are disabled in production",
+        )
+    configured = settings.whatsapp_relay_token.strip()
     if not configured:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -426,13 +605,19 @@ async def whatsapp_webhook_relay(request: Request):
     supplied = (request.headers.get("x-northstar-relay-token") or "").strip()
     if not supplied or not secrets.compare_digest(supplied, configured):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid relay token")
-    return await _enqueue_whatsapp_webhook(await request.body())
+    return await _enqueue_whatsapp_webhook(await _read_bounded_whatsapp_body(request))
 
 
 @app.post("/v1/whatsapp/ziplin/relay")
 async def ziplin_whatsapp_webhook_relay(request: Request):
-    """Dedicated relay target for the Ziplin WhatsApp number only."""
-    configured = get_settings().whatsapp_relay_token.strip()
+    """Legacy non-production compatibility path; Ziplin uses direct Meta delivery."""
+    settings = get_settings()
+    if settings.app_environment.casefold() == "production":
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Legacy WhatsApp relays are disabled in production",
+        )
+    configured = settings.whatsapp_relay_token.strip()
     if not configured:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -441,7 +626,7 @@ async def ziplin_whatsapp_webhook_relay(request: Request):
     supplied = (request.headers.get("x-ziplin-relay-token") or "").strip()
     if not supplied or not secrets.compare_digest(supplied, configured):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Ziplin relay token")
-    return await _enqueue_whatsapp_webhook(await request.body())
+    return await _enqueue_whatsapp_webhook(await _read_bounded_whatsapp_body(request))
 
 
 @app.post("/v1/admin/whatsapp/send-program-menu", dependencies=[Depends(require_admin_token)])

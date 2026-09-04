@@ -1844,6 +1844,287 @@ section[style] > .pagination {
   white-space: pre-wrap;
 }
 
+/* Protected WhatsApp conversation inbox */
+.conversation-panel {
+  overflow: hidden;
+}
+
+.conversation-list {
+  display: grid;
+}
+
+.conversation-list > .empty-state {
+  min-height: 320px;
+}
+
+.conversation-row {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  min-height: 104px;
+  padding: 17px 18px;
+  align-items: center;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  gap: 14px;
+  text-align: left;
+  background: var(--paper);
+  border: 0;
+  border-bottom: 1px solid var(--ink-100);
+  cursor: pointer;
+  transition: background 140ms ease;
+}
+
+.conversation-row:last-child {
+  border-bottom: 0;
+}
+
+.conversation-row:hover,
+.conversation-row:focus-visible {
+  background: var(--teal-50);
+}
+
+.conversation-row__avatar {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  place-items: center;
+  color: var(--teal-700);
+  background: var(--teal-100);
+  border-radius: 14px;
+}
+
+.conversation-row__avatar .icon {
+  width: 19px;
+  height: 19px;
+}
+
+.conversation-row__main,
+.conversation-row__heading {
+  min-width: 0;
+}
+
+.conversation-row__main {
+  display: grid;
+  gap: 4px;
+}
+
+.conversation-row__heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.conversation-row__heading strong {
+  overflow: hidden;
+  color: var(--ink-950);
+  font-size: 0.82rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversation-row__heading time,
+.conversation-row__phone,
+.conversation-row__count {
+  color: var(--ink-500);
+  font-size: 0.66rem;
+}
+
+.conversation-row__heading time {
+  flex: none;
+}
+
+.conversation-row__phone {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.conversation-row__preview {
+  overflow: hidden;
+  color: var(--ink-700);
+  font-size: 0.76rem;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversation-row__count {
+  padding: 5px 8px;
+  background: var(--ink-50);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.conversation-row__arrow {
+  color: var(--ink-400);
+}
+
+.conversation-row__arrow .icon {
+  width: 17px;
+  height: 17px;
+}
+
+.conversation-thread {
+  display: grid;
+  gap: 12px;
+}
+
+.conversation-thread__summary {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.conversation-thread__summary > span,
+.conversation-thread__summary strong,
+.conversation-thread__summary small {
+  display: block;
+  min-width: 0;
+}
+
+.conversation-thread__summary strong {
+  color: var(--ink-900);
+  font-size: 0.78rem;
+}
+
+.conversation-thread__summary small,
+.conversation-thread__limit,
+.conversation-thread__privacy {
+  color: var(--ink-500);
+  font-size: 0.67rem;
+}
+
+.conversation-thread__summary small {
+  margin-top: 3px;
+}
+
+.conversation-thread__limit {
+  margin: 0;
+  padding: 9px 11px;
+  text-align: center;
+  background: var(--amber-50);
+  border: 1px solid var(--amber-100);
+  border-radius: 9px;
+}
+
+.conversation-thread__messages {
+  display: flex;
+  min-height: 260px;
+  max-height: min(56vh, 570px);
+  padding: 18px;
+  overflow-y: auto;
+  flex-direction: column;
+  gap: 14px;
+  background: var(--ink-50);
+  border: 1px solid var(--ink-100);
+  border-radius: 13px;
+  overscroll-behavior: contain;
+}
+
+.conversation-message {
+  display: flex;
+  width: min(82%, 560px);
+  min-width: 0;
+  flex-direction: column;
+  align-self: flex-start;
+}
+
+.conversation-message--outbound {
+  align-self: flex-end;
+}
+
+.conversation-message__label,
+.conversation-message__meta {
+  display: flex;
+  padding: 0 4px;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 9px;
+  color: var(--ink-500);
+  font-size: 0.61rem;
+}
+
+.conversation-message__label {
+  margin-bottom: 5px;
+  font-weight: 800;
+  letter-spacing: 0.035em;
+  text-transform: uppercase;
+}
+
+.conversation-message--outbound .conversation-message__label,
+.conversation-message--outbound .conversation-message__meta {
+  justify-content: flex-end;
+}
+
+.conversation-message__bubble {
+  min-width: 0;
+  padding: 12px 14px;
+  color: var(--ink-900);
+  background: var(--paper);
+  border: 1px solid var(--ink-150);
+  border-radius: 5px 14px 14px 14px;
+  box-shadow: var(--shadow-sm);
+}
+
+.conversation-message--outbound .conversation-message__bubble {
+  color: var(--ink-950);
+  background: var(--teal-100);
+  border-color: rgba(42, 142, 127, 0.18);
+  border-radius: 14px 5px 14px 14px;
+}
+
+.conversation-message__bubble p {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 0.79rem;
+  line-height: 1.58;
+  white-space: pre-wrap;
+}
+
+.conversation-message__media {
+  display: flex;
+  min-height: 58px;
+  margin-bottom: 9px;
+  padding: 11px;
+  align-items: center;
+  gap: 9px;
+  color: var(--ink-600);
+  background: rgba(255, 255, 255, 0.55);
+  border: 1px dashed var(--ink-300);
+  border-radius: 9px;
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.conversation-message__media:last-child {
+  margin-bottom: 0;
+}
+
+.conversation-message__media .icon {
+  width: 18px;
+  height: 18px;
+}
+
+.conversation-message__meta {
+  margin-top: 5px;
+}
+
+.conversation-thread__privacy {
+  margin: 0;
+  text-align: center;
+  line-height: 1.5;
+}
+
+.conversation-thread__loading .skeleton-grid {
+  margin: 0;
+}
+
+.conversation-thread__error {
+  min-height: 330px;
+}
+
 .definition-list {
   display: grid;
   margin: 0;
@@ -2086,6 +2367,10 @@ section[style] > .pagination {
   border: 0;
   border-radius: var(--radius-xl);
   box-shadow: var(--shadow-lg);
+}
+
+.dialog--conversation {
+  width: min(96vw, 780px);
 }
 
 .dialog::backdrop {
@@ -2358,6 +2643,26 @@ section[style] > .pagination {
     margin: 0;
   }
 
+  .conversation-row {
+    padding: 15px;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 11px;
+  }
+
+  .conversation-row__count {
+    grid-column: 2;
+    justify-self: start;
+  }
+
+  .conversation-row__arrow {
+    grid-column: 3;
+    grid-row: 1 / span 2;
+  }
+
+  .conversation-message {
+    width: 90%;
+  }
+
   .pagination {
     align-items: stretch;
     flex-direction: column;
@@ -2437,6 +2742,24 @@ section[style] > .pagination {
 
   .dialog__surface {
     max-height: calc(100vh - 20px);
+  }
+
+  .conversation-thread__summary {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .conversation-thread__summary .button {
+    width: 100%;
+  }
+
+  .conversation-thread__messages {
+    max-height: 58vh;
+    padding: 13px;
+  }
+
+  .conversation-message {
+    width: 96%;
   }
 }
 
